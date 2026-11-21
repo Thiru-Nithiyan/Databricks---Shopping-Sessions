@@ -176,9 +176,9 @@ EV_COLS = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id",
 con.execute(f"""
 CREATE TEMP TABLE ev_kept AS
 SELECT event_id,
-       arg_min(user_id, ingest_ts) AS user_id, arg_min(ts, ingest_ts) AS ts, min(ingest_ts) AS ingest_ts,
-       arg_min(event_type, ingest_ts) AS event_type, arg_min(product_id, ingest_ts) AS product_id,
-       arg_min(price_cents, ingest_ts) AS price_cents
+       arg_min_null(user_id, ingest_ts) AS user_id, arg_min_null(ts, ingest_ts) AS ts, min(ingest_ts) AS ingest_ts,
+       arg_min_null(event_type, ingest_ts) AS event_type, arg_min_null(product_id, ingest_ts) AS product_id,
+       arg_min_null(price_cents, ingest_ts) AS price_cents
 FROM ({parsed(ev_glob, EV_COLS)})
 WHERE event_id IS NOT NULL
 GROUP BY event_id
