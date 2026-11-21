@@ -941,9 +941,9 @@ struct Dims {
     ncat: usize,
 }
 
-/// Order of persons inside a person shard: 10 bits of the key (above the 8 that pick the shard)
+/// Order of persons inside a person shard: 12 bits of the key (above the 8 that pick the shard)
 /// first, so the shard can be bucketed in one pass and only small buckets sorted.
-const NBUCKET: usize = 1024;
+const NBUCKET: usize = 4096;
 
 #[inline]
 fn bucket_of(person: u64) -> usize {
@@ -1220,6 +1220,11 @@ fn ba(s: &[u8]) -> ByteArray {
     ByteArray::from(s.to_vec())
 }
 
+/// A string that lives for the whole run (mapped input), passed without a copy.
+fn ba_static(s: Bytes) -> ByteArray {
+    ByteArray::from(bytes::Bytes::from_static(s))
+}
+
 #[inline(never)]
 fn write_users(path: &Path, rows: &[UserRow], cats: &[Bytes]) {
     let schema = Arc::new(
@@ -1233,7 +1238,7 @@ fn write_users(path: &Path, rows: &[UserRow], cats: &[Bytes]) {
     let mut w = SerializedFileWriter::new(File::create(path).unwrap(), schema, props()).unwrap();
     for rg in rows.chunks(1 << 20) {
         let mut g = w.next_row_group().unwrap();
-        let v: Vec<ByteArray> = rg.iter().map(|r| ba(unpack(r.name))).collect();
+        let v: Vec<ByteArray> = rg.iter().map(|r| ba_static(unpack(r.name))).collect();
         let mut c = g.next_column().unwrap().unwrap();
         c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
         c.close().unwrap();
@@ -1255,7 +1260,7 @@ fn write_users(path: &Path, rows: &[UserRow], cats: &[Bytes]) {
             c.close().unwrap();
         }
         let defs: Vec<i16> = rg.iter().map(|r| (r.top != NO_CAT) as i16).collect();
-        let v: Vec<ByteArray> = rg.iter().filter(|r| r.top != NO_CAT).map(|r| ba(cats[r.top as usize])).collect();
+        let v: Vec<ByteArray> = rg.iter().filter(|r| r.top != NO_CAT).map(|r| ba_static(cats[r.top as usize])).collect();
         let mut c = g.next_column().unwrap().unwrap();
         c.typed::<ByteArrayType>().write_batch(&v, Some(&defs), None).unwrap();
         c.close().unwrap();
