@@ -540,17 +540,19 @@ fn read_manifest(dir: &Path) -> (i64, i64) {
 
 // ------------------------------------------------------------------ records
 
-/// Dedup key of one event copy. `rec` is the copy's index in its chunk's `evs`, or u32::MAX
-/// when the copy is invalid (it can still be the kept copy, and then the event is dropped).
-#[derive(Clone, Copy)]
+/// Dedup key of one event copy. A valid copy lives at `outs[thread].evs[part][idx]`; `idx` is
+/// u32::MAX for an invalid copy (it can still be the kept copy, and then the event is dropped).
+#[derive(Clone, Copy, Default)]
 struct Key {
     id0: u64,
     ing: i64,
-    id1: u32,
-    rec: u32,
+    idx: u32,
+    id1: u16,
+    part: u8,
+    thread: u8,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Ev {
     person: u64,
     name: u64,
@@ -568,62 +570,75 @@ struct Click {
     id: Bytes,
 }
 
-/// One parsed chunk of events. Valid copies are final events grouped by person shard
-/// (`evs[eoff[p]..eoff[p + 1]]`); dedup keys of all copies are grouped by event-id shard
-/// (`keys[koff[s]..koff[s + 1]]`). Dedup sets a bit in `dead` for every copy that loses.
-struct EvChunk {
-    evs: Vec<Ev>,
-    eoff: [u32; NPART + 1],
-    keys: Vec<Key>,
-    koff: [u32; NSHARD + 1],
-    dead: Vec<AtomicU64>,
+/// Everything one worker thread parsed: valid events by person shard and dedup keys of all
+/// copies by event-id shard.
+struct ThreadOut {
+    evs: Vec<Vec<Ev>>,
+    keys: Vec<Vec<Key>>,
 }
 
-impl EvChunk {
-    fn shard(&self, s: usize) -> &[Key] {
-        &self.keys[self.koff[s] as usize..self.koff[s + 1] as usize]
+impl ThreadOut {
+    fn new(per_part: usize) -> ThreadOut {
+        ThreadOut {
+            evs: (0..NPART).map(|_| Vec::with_capacity(per_part)).collect(),
+            keys: (0..NSHARD).map(|_| Vec::with_capacity(per_part * 9 / 8)).collect(),
+        }
     }
 }
 
-#[derive(Default)]
-struct Scratch {
-    keys: Vec<Key>,
-    evs: Vec<Ev>,
-    pos: Vec<u32>,
+/// Parsed events wait here while their link-table lookups are prefetched; the oldest is then
+/// resolved and written straight to its person shard.
+struct Pipe {
+    ring: [(Ev, Key); Pipe::N],
+    head: usize,
+    tail: usize,
 }
 
-/// Stable counting sort of `v` by `bucket` into a new vector; returns it with the bucket offsets
-/// and, in `pos`, the new index of every element. Buckets are below 256 (NPART and NSHARD).
-fn group_by<T: Copy>(v: &[T], bucket: impl Fn(&T) -> usize, pos: &mut Vec<u32>) -> (Vec<T>, [u32; 257]) {
-    const B: usize = 256;
-    let mut off = [0u32; B + 1];
-    for e in v {
-        off[bucket(e) + 1] += 1;
+impl Pipe {
+    const N: usize = 32;
+    const AHEAD: usize = 16;
+
+    fn new() -> Pipe {
+        Pipe { ring: [(Ev::default(), Key::default()); Pipe::N], head: 0, tail: 0 }
     }
-    for i in 0..B {
-        off[i + 1] += off[i];
+
+    #[inline]
+    fn push(&mut self, ev: Ev, key: Key, linked: &LinkTable, out: &mut ThreadOut, tid: u8) {
+        linked.prefetch_filter(ev.person);
+        if self.head - self.tail == Self::N {
+            self.pop(linked, out, tid);
+        }
+        self.ring[self.head % Self::N] = (ev, key);
+        self.head += 1;
+        if self.head - self.tail > Self::AHEAD {
+            linked.prefetch(self.ring[(self.head - Self::AHEAD) % Self::N].0.person);
+        }
     }
-    let mut next = off;
-    let mut out: Vec<T> = Vec::with_capacity(v.len());
-    // SAFETY: every slot in 0..v.len() is written exactly once below.
-    unsafe { out.set_len(v.len()) };
-    pos.clear();
-    for e in v {
-        let b = bucket(e);
-        out[next[b] as usize] = *e;
-        pos.push(next[b]);
-        next[b] += 1;
+
+    #[inline]
+    fn pop(&mut self, linked: &LinkTable, out: &mut ThreadOut, tid: u8) {
+        let (mut ev, mut key) = self.ring[self.tail % Self::N];
+        self.tail += 1;
+        (ev.person, ev.name) = person(linked, ev.person, ev.name);
+        let p = (ev.person % NPART as u64) as usize;
+        let v = &mut out.evs[p];
+        key.idx = v.len() as u32;
+        key.part = p as u8;
+        key.thread = tid;
+        v.push(ev);
+        out.keys[(key.id0 % NSHARD as u64) as usize].push(key);
     }
-    (out, off)
+
+    fn drain(&mut self, linked: &LinkTable, out: &mut ThreadOut, tid: u8) {
+        while self.tail < self.head {
+            self.pop(linked, out, tid);
+        }
+    }
 }
 
 #[inline(never)]
-fn parse_events(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, sc: &mut Scratch) -> EvChunk {
-    sc.keys.clear();
-    sc.keys.reserve(chunk.len() / 48 + 16);
-    sc.evs.clear();
-    sc.evs.reserve(chunk.len() / 48 + 16);
-    let (keys, evs) = (&mut sc.keys, &mut sc.evs);
+fn parse_events(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, out: &mut ThreadOut, tid: u8) {
+    let mut pipe = Pipe::new();
     for_each_line::<7>(chunk, |f| {
         if f[0].is_empty() {
             return;
@@ -631,7 +646,14 @@ fn parse_events(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, sc: &mut Scratch) -
         let id = xxh3_128(f[0]);
         let ts = parse_ts(f[2]);
         let ing = parse_ts(f[3]);
-        let mut key = Key { id0: id as u64, ing: ing.unwrap_or(i64::MAX), id1: (id >> 64) as u32, rec: u32::MAX };
+        let key = Key {
+            id0: id as u64,
+            ing: ing.unwrap_or(i64::MAX),
+            idx: u32::MAX,
+            id1: (id >> 64) as u16,
+            part: 0,
+            thread: tid,
+        };
         let et = match f[4] {
             b"view" | b"cart" => 1,
             b"purchase" => 2,
@@ -652,39 +674,20 @@ fn parse_events(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, sc: &mut Scratch) -
             };
         }
         if ok {
-            key.rec = evs.len() as u32;
-            evs.push(Ev {
-                person: xxh3_64(f[1]), // the user id hash until persons are resolved below
+            let ev = Ev {
+                person: xxh3_64(f[1]), // the user id hash until the pipe resolves the person
                 name: pack(f[1]),
                 ts: ts.unwrap(),
                 price,
                 cat: ctx.products.get(f[5]).unwrap_or(ctx.unknown),
                 purch: et == 2,
-            });
+            };
+            pipe.push(ev, key, linked, out, tid);
+        } else {
+            out.keys[(key.id0 % NSHARD as u64) as usize].push(key);
         }
-        keys.push(key);
     });
-    let n = evs.len();
-    for i in 0..n {
-        if i + 32 < n {
-            linked.prefetch_filter(evs[i + 32].person);
-        }
-        if i + 16 < n {
-            linked.prefetch(evs[i + 16].person);
-        }
-        let e = &mut evs[i];
-        (e.person, e.name) = person(linked, e.person, e.name);
-    }
-    let (evs, eoff) = group_by(&sc.evs, |e| (e.person % NPART as u64) as usize, &mut sc.pos);
-    for k in sc.keys.iter_mut() {
-        if k.rec != u32::MAX {
-            k.rec = sc.pos[k.rec as usize];
-        }
-    }
-    let mut unused = Vec::new();
-    let (keys, koff) = group_by(&sc.keys, |k| (k.id0 % NSHARD as u64) as usize, &mut unused);
-    let dead = (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
-    EvChunk { evs, eoff, keys, koff, dead }
+    pipe.drain(linked, out, tid);
 }
 
 /// Clicks of one chunk grouped by person shard: shard `p` is `recs[off[p]..off[p + 1]]`.
@@ -986,13 +989,13 @@ fn gather_bucketed<'a, T: Copy + 'a>(
 
 /// Surviving events of person shard `p`, ordered by (person_order, ts).
 #[inline(never)]
-fn gather_events(parsed: &[EvChunk], p: usize, evs: &mut Vec<Ev>) {
-    let alive = |c: &EvChunk, r: usize| c.dead[r >> 6].load(Relaxed) & (1 << (r & 63)) == 0;
+fn gather_events(outs: &[ThreadOut], dead: &[Vec<Vec<AtomicU64>>], p: usize, evs: &mut Vec<Ev>) {
+    let alive = |d: &[AtomicU64], r: usize| d[r >> 6].load(Relaxed) & (1 << (r & 63)) == 0;
     let mut off = vec![0u32; NBUCKET + 1];
-    for c in parsed {
-        for r in c.eoff[p] as usize..c.eoff[p + 1] as usize {
-            if alive(c, r) {
-                off[bucket_of(c.evs[r].person) + 1] += 1;
+    for (o, d) in outs.iter().zip(dead) {
+        for (r, e) in o.evs[p].iter().enumerate() {
+            if alive(&d[p], r) {
+                off[bucket_of(e.person) + 1] += 1;
             }
         }
     }
@@ -1005,10 +1008,9 @@ fn gather_events(parsed: &[EvChunk], p: usize, evs: &mut Vec<Ev>) {
     // SAFETY: capacity is reserved and the pass below writes every slot of 0..n once.
     unsafe { evs.set_len(n) };
     let mut next = off.clone();
-    for c in parsed {
-        for r in c.eoff[p] as usize..c.eoff[p + 1] as usize {
-            if alive(c, r) {
-                let e = c.evs[r];
+    for (o, d) in outs.iter().zip(dead) {
+        for (r, &e) in o.evs[p].iter().enumerate() {
+            if alive(&d[p], r) {
                 let b = bucket_of(e.person);
                 evs[next[b] as usize] = e;
                 next[b] += 1;
@@ -1307,31 +1309,24 @@ fn write_campaigns(path: &Path, rows: &[CampRow]) {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// A dedup key with the chunk it came from.
-#[derive(Clone, Copy)]
-struct GKey {
-    id0: u64,
-    ing: i64,
-    id1: u32,
-    rec: u32,
-    chunk: u32,
-}
+/// Dedup one event-id shard over the keys of every thread (see `dedup_shard`).
+type GKey = Key;
 
 /// Dedup one event-id shard: for every event id the copy with the smallest ingest_ts is kept
 /// (equal ones are identical); every other valid copy is marked dead in its chunk. The table
 /// holds the current winner of each id as (32-bit tag of the first id word, index in `g`), so
 /// a probe rarely touches `g`.
 #[inline(never)]
-fn dedup_shard(g: &[GKey], table: &mut Vec<u64>, chunks: &[EvChunk]) {
+fn dedup_shard(g: &[GKey], table: &mut Vec<u64>, dead: &[Vec<Vec<AtomicU64>>]) {
     const EMPTY: u64 = u64::MAX;
     let cap = (g.len() * 2).next_power_of_two().max(1024);
     let mask = cap - 1;
     table.clear();
     table.resize(cap, EMPTY);
     let kill = |k: &GKey| {
-        if k.rec != u32::MAX {
-            let r = k.rec as usize;
-            chunks[k.chunk as usize].dead[r >> 6].fetch_or(1 << (r & 63), Relaxed);
+        if k.idx != u32::MAX {
+            let r = k.idx as usize;
+            dead[k.thread as usize][k.part as usize][r >> 6].fetch_or(1 << (r & 63), Relaxed);
         }
     };
     for (i, k) in g.iter().enumerate() {
@@ -1365,7 +1360,8 @@ fn dedup_shard(g: &[GKey], table: &mut Vec<u64>, chunks: &[EvChunk]) {
 /// fault in, and rayon's `map_init` would rebuild its state for every split job.
 #[derive(Default)]
 struct Bufs {
-    ev: Scratch,
+    tid: u8,
+    out: Option<ThreadOut>,
     clicks: Vec<Click>,
     g: Vec<GKey>,
     table: Vec<u64>,
@@ -1378,7 +1374,7 @@ struct Pool(Vec<Mutex<Bufs>>);
 
 impl Pool {
     fn new() -> Pool {
-        Pool((0..rayon::current_num_threads() + 1).map(|_| Mutex::new(Bufs::default())).collect())
+        Pool((0..rayon::current_num_threads() + 1).map(|i| Mutex::new(Bufs { tid: i as u8, ..Default::default() })).collect())
     }
 
     /// Run `f` with this thread's buffers (no rayon calls may happen inside `f`).
@@ -1455,10 +1451,27 @@ fn main() {
 
     let pool = Pool::new();
 
-    // parse events
-    let ev_chunks = chunks(&csv_files(&data.join("events")));
-    let parsed: Vec<EvChunk> =
-        ev_chunks.par_iter().map(|c| pool.with(|b| parse_events(c, &ctx, &linked, &mut b.ev))).collect();
+    // parse events: each thread writes its own person and event-id shards
+    let ev_files = csv_files(&data.join("events"));
+    let ev_bytes: u64 = ev_files.iter().map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum();
+    let per_part = (ev_bytes as usize / 64 / pool.0.len() / NPART).max(64);
+    let ev_chunks = chunks(&ev_files);
+    ev_chunks.par_iter().for_each(|c| {
+        pool.with(|b| {
+            let tid = b.tid;
+            let out = b.out.get_or_insert_with(|| ThreadOut::new(per_part));
+            parse_events(c, &ctx, &linked, out, tid)
+        })
+    });
+    let outs: Vec<ThreadOut> = pool
+        .0
+        .iter()
+        .map(|m| m.lock().unwrap().out.take().unwrap_or_else(|| ThreadOut { evs: (0..NPART).map(|_| vec![]).collect(), keys: (0..NSHARD).map(|_| vec![]).collect() }))
+        .collect();
+    let dead: Vec<Vec<Vec<AtomicU64>>> = outs
+        .par_iter()
+        .map(|o| o.evs.iter().map(|v| (0..v.len().div_ceil(64)).map(|_| AtomicU64::new(0)).collect()).collect())
+        .collect();
     log(&t, "events parsed");
 
     // dedup per event-id shard
@@ -1466,10 +1479,10 @@ fn main() {
         pool.with(|b| {
             let (g, table) = (&mut b.g, &mut b.table);
             g.clear();
-            for (ci, c) in parsed.iter().enumerate() {
-                g.extend(c.shard(s).iter().map(|k| GKey { id0: k.id0, ing: k.ing, id1: k.id1, rec: k.rec, chunk: ci as u32 }));
+            for o in &outs {
+                g.extend_from_slice(&o.keys[s]);
             }
-            dedup_shard(g, table, &parsed);
+            dedup_shard(g, table, &dead);
         })
     });
     log(&t, "events deduped");
@@ -1497,7 +1510,7 @@ fn main() {
         .for_each(|p| {
             pool.with(|b| {
                 let (evs, cks) = (&mut b.pevs, &mut b.pcks);
-                gather_events(&parsed, p, evs);
+                gather_events(&outs, &dead, p, evs);
                 gather_clicks(&click_parts, p, cks);
                 let users = process_part(evs, cks, &dims, &mut b.camp);
                 if !users.is_empty() || p == 0 {
@@ -1505,7 +1518,8 @@ fn main() {
                 }
             })
         });
-    std::mem::forget(parsed); // freeing thousands of vectors costs more than it saves
+    std::mem::forget(outs); // freeing thousands of vectors costs more than it saves
+    std::mem::forget(dead);
     std::mem::forget(click_parts);
     log(&t, "sessions, credit and assists done");
 
