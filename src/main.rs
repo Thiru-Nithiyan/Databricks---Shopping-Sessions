@@ -6,7 +6,6 @@
 //! assisted per person shard; each shard writes its own Parquet part.
 
 use std::fs::{self, File};
-use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -35,21 +34,6 @@ const NO_CAT: u8 = 255;
 type Bytes = &'static [u8];
 
 // ------------------------------------------------------------------ utilities
-
-#[derive(Default)]
-struct IdHasher(u64);
-impl Hasher for IdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, _: &[u8]) {
-        unreachable!()
-    }
-    fn write_u64(&mut self, v: u64) {
-        self.0 = v;
-    }
-}
-type IdMap<V> = HashMap<u64, V, BuildHasherDefault<IdHasher>>;
 
 fn log(t: &Instant, msg: &str) {
     eprintln!("[{:7.2}s] {}", t.elapsed().as_secs_f64(), msg);
@@ -283,31 +267,46 @@ fn dig2(s: &[u8], i: usize) -> Option<i64> {
 }
 
 /// Timestamp field -> epoch ms, None when it is a bad timestamp.
+#[inline]
 fn parse_ts(s: &[u8]) -> Option<i64> {
-    if s.is_empty() {
-        return None;
-    }
-    if s.iter().all(|b| b.is_ascii_digit()) {
-        let mut v: i64 = 0;
-        for &b in s {
-            v = v.checked_mul(10)?.checked_add((b - b'0') as i64)?;
-        }
-        return Some(v);
-    }
     let n = s.len();
-    if n != 20 && n != 25 {
+    if (n == 20 || n == 25) && s[4] == b'-' {
+        return parse_iso(s);
+    }
+    if n == 0 || !s.iter().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    let mut v: i64 = 0;
+    for &b in s {
+        v = v.checked_mul(10)?.checked_add((b - b'0') as i64)?;
+    }
+    Some(v)
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` or `YYYY-MM-DDTHH:MM:SS+HH:MM` (length 20 or 25, `-` at 4).
+fn parse_iso(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
         return None;
     }
-    let y = dig2(s, 0)? * 100 + dig2(s, 2)?;
-    let mo = dig2(s, 5)?;
-    let d = dig2(s, 8)?;
-    let h = dig2(s, 11)?;
-    let mi = dig2(s, 14)?;
-    let se = dig2(s, 17)?;
-    if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 {
+    const POS: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
+    let mut d = [0i64; 14];
+    let mut bad = false;
+    for (k, &p) in POS.iter().enumerate() {
+        let x = s[p].wrapping_sub(b'0');
+        bad |= x > 9;
+        d[k] = x as i64;
+    }
+    if bad {
+        return None;
+    }
+    let y = d[0] * 1000 + d[1] * 100 + d[2] * 10 + d[3];
+    let mo = d[4] * 10 + d[5];
+    let dd = d[6] * 10 + d[7];
+    let h = d[8] * 10 + d[9];
+    let mi = d[10] * 10 + d[11];
+    let se = d[12] * 10 + d[13];
+    if !(1..=12).contains(&mo) || dd < 1 || h > 23 || mi > 59 || se > 59 {
         return None;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
@@ -316,7 +315,7 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
         4 | 6 | 9 | 11 => 30,
         _ => 31,
     };
-    if d > dim {
+    if dd > dim {
         return None;
     }
     let off = if n == 20 {
@@ -340,7 +339,7 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
         }
         sign * (oh * 3_600_000 + om * 60_000)
     };
-    Some(days_from_civil(y, mo, d) * DAY_MS + h * 3_600_000 + mi * 60_000 + se * 1000 - off)
+    Some(days_from_civil(y, mo, dd) * DAY_MS + h * 3_600_000 + mi * 60_000 + se * 1000 - off)
 }
 
 fn parse_price(s: &[u8]) -> Option<u32> {
@@ -776,9 +775,55 @@ struct Dims {
     ncat: usize,
 }
 
-fn process_part(evs: &mut [Ev], clicks: &mut [Click], d: &Dims) -> PartOut {
-    evs.sort_unstable_by_key(|e| (e.person, e.ts));
-    clicks.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.cmp(b.id)));
+/// Order of persons inside a person shard: 10 bits of the key (above the 8 that pick the shard)
+/// first, so the shard can be bucketed in one pass and only small buckets sorted.
+const NBUCKET: usize = 1024;
+
+#[inline]
+fn bucket_of(person: u64) -> usize {
+    ((person >> 8) as usize) & (NBUCKET - 1)
+}
+
+#[inline]
+fn person_order(person: u64) -> (usize, u64) {
+    (bucket_of(person), person)
+}
+
+/// Copy the slices of `srcs` into `out` grouped by `bucket` (a counting sort); returns the
+/// bucket offsets.
+fn gather_bucketed<'a, T: Copy + 'a>(
+    srcs: impl Iterator<Item = &'a [T]> + Clone,
+    out: &mut Vec<T>,
+    bucket: impl Fn(&T) -> usize,
+) -> Vec<u32> {
+    let mut off = vec![0u32; NBUCKET + 1];
+    for sl in srcs.clone() {
+        for e in sl {
+            off[bucket(e) + 1] += 1;
+        }
+    }
+    for i in 0..NBUCKET {
+        off[i + 1] += off[i];
+    }
+    let n = off[NBUCKET] as usize;
+    out.clear();
+    out.reserve(n);
+    // SAFETY: capacity is reserved and the counting pass writes every slot of 0..n once.
+    unsafe { out.set_len(n) };
+    let mut next = off.clone();
+    for sl in srcs {
+        for e in sl {
+            let b = bucket(e);
+            out[next[b] as usize] = *e;
+            next[b] += 1;
+        }
+    }
+    off
+}
+
+/// Sessions, credit and assists of one person shard. `evs` is ordered by (person_order, ts) and
+/// `clicks` by (person_order, ts, click id).
+fn process_part(evs: &[Ev], clicks: &[Click], d: &Dims) -> PartOut {
     let mut out = PartOut {
         users: vec![],
         credit: vec![0; d.ncid * d.ndays * 3],
@@ -859,7 +904,7 @@ fn process_part(evs: &mut [Ev], clicks: &mut [Click], d: &Dims) -> PartOut {
         flush!();
 
         // clicks of this person
-        while ci < clicks.len() && clicks[ci].person < person {
+        while ci < clicks.len() && person_order(clicks[ci].person) < person_order(person) {
             ci += 1;
         }
         let mut cj = ci;
@@ -1207,18 +1252,42 @@ fn main() {
         .map_init(
             || (Vec::<Ev>::new(), Vec::<Click>::new()),
             |(evs, cks), p| {
-                evs.clear();
+                // surviving events of this shard, bucketed while gathered
+                let alive = |c: &EvChunk, r: usize| c.dead[r >> 6].load(Relaxed) & (1 << (r & 63)) == 0;
+                let mut off = vec![0u32; NBUCKET + 1];
                 for c in &parsed {
-                    let (a, b) = (c.eoff[p] as usize, c.eoff[p + 1] as usize);
-                    for r in a..b {
-                        if c.dead[r >> 6].load(Relaxed) & (1 << (r & 63)) == 0 {
-                            evs.push(c.evs[r]);
+                    for r in c.eoff[p] as usize..c.eoff[p + 1] as usize {
+                        if alive(c, r) {
+                            off[bucket_of(c.evs[r].person) + 1] += 1;
                         }
                     }
                 }
-                cks.clear();
-                for s in &click_parts {
-                    cks.extend_from_slice(s.part(p));
+                for i in 0..NBUCKET {
+                    off[i + 1] += off[i];
+                }
+                let n = off[NBUCKET] as usize;
+                evs.clear();
+                evs.reserve(n);
+                // SAFETY: capacity is reserved and the pass below writes every slot of 0..n once.
+                unsafe { evs.set_len(n) };
+                let mut next = off.clone();
+                for c in &parsed {
+                    for r in c.eoff[p] as usize..c.eoff[p + 1] as usize {
+                        if alive(c, r) {
+                            let e = c.evs[r];
+                            let b = bucket_of(e.person);
+                            evs[next[b] as usize] = e;
+                            next[b] += 1;
+                        }
+                    }
+                }
+                for w in off.windows(2) {
+                    evs[w[0] as usize..w[1] as usize].sort_unstable_by_key(|e| (e.person, e.ts));
+                }
+                let coff = gather_bucketed(click_parts.iter().map(|s| s.part(p)), cks, |c| bucket_of(c.person));
+                for w in coff.windows(2) {
+                    cks[w[0] as usize..w[1] as usize]
+                        .sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.cmp(b.id)));
                 }
                 process_part(evs, cks, &dims)
             },
