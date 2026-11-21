@@ -21,7 +21,7 @@ use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const GAP_MS: i64 = 1_800_000;
-const NSHARD: usize = 256; // event-id shards (dedup)
+const NSHARD: usize = 512; // event-id shards (dedup): small enough tables to stay in cache
 const NPART: usize = 256; // person shards
 const CHUNK: usize = 8 << 20; // events
 const SMALL_CHUNK: usize = 1 << 20; // clicks and links: fewer, unevenly sized files
@@ -1130,7 +1130,7 @@ const NBUCKET: usize = 4096;
 
 #[inline]
 fn bucket_of(person: u64) -> usize {
-    ((person >> 8) as usize) & (NBUCKET - 1)
+    ((person >> NPART.trailing_zeros()) as usize) & (NBUCKET - 1)
 }
 
 #[inline]
