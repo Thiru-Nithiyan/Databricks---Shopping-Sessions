@@ -315,8 +315,20 @@ struct Click {
     id: Bytes,
 }
 
-fn parse_events(chunk: Bytes, ctx: &Ctx) -> Vec<Vec<Rec>> {
-    let mut out: Vec<Vec<Rec>> = (0..NSHARD).map(|_| Vec::new()).collect();
+/// Records of one chunk grouped by event-id shard: shard `s` is `recs[off[s]..off[s + 1]]`.
+struct Parsed {
+    recs: Vec<Rec>,
+    off: [u32; NSHARD + 1],
+}
+
+impl Parsed {
+    fn shard(&self, s: usize) -> &[Rec] {
+        &self.recs[self.off[s] as usize..self.off[s + 1] as usize]
+    }
+}
+
+fn parse_events(chunk: Bytes, ctx: &Ctx) -> Parsed {
+    let mut flat: Vec<Rec> = Vec::with_capacity(chunk.len() / 56 + 16);
     let mut pos = 0;
     while pos < chunk.len() {
         let end = memchr(b'\n', &chunk[pos..]).map_or(chunk.len(), |i| pos + i);
@@ -367,13 +379,41 @@ fn parse_events(chunk: Bytes, ctx: &Ctx) -> Vec<Vec<Rec>> {
             }
             rec.ok = true;
         }
-        out[(rec.id[0] % NSHARD as u64) as usize].push(rec);
+        flat.push(rec);
     }
-    out
+    let mut off = [0u32; NSHARD + 1];
+    for r in &flat {
+        off[(r.id[0] % NSHARD as u64) as usize + 1] += 1;
+    }
+    for i in 0..NSHARD {
+        off[i + 1] += off[i];
+    }
+    let mut next = off;
+    let mut recs: Vec<Rec> = Vec::with_capacity(flat.len());
+    // SAFETY: every slot in 0..flat.len() is written exactly once by the counting sort below.
+    unsafe { recs.set_len(flat.len()) };
+    for r in &flat {
+        let sh = (r.id[0] % NSHARD as u64) as usize;
+        recs[next[sh] as usize] = *r;
+        next[sh] += 1;
+    }
+    Parsed { recs, off }
 }
 
-fn parse_clicks(chunk: Bytes, ctx: &Ctx) -> Vec<Vec<Click>> {
-    let mut out: Vec<Vec<Click>> = (0..NPART).map(|_| Vec::new()).collect();
+/// Clicks of one chunk grouped by person shard: shard `p` is `recs[off[p]..off[p + 1]]`.
+struct PClicks {
+    recs: Vec<Click>,
+    off: [u32; NPART + 1],
+}
+
+impl PClicks {
+    fn part(&self, p: usize) -> &[Click] {
+        &self.recs[self.off[p] as usize..self.off[p + 1] as usize]
+    }
+}
+
+fn parse_clicks(chunk: Bytes, ctx: &Ctx) -> PClicks {
+    let mut flat: Vec<Click> = Vec::with_capacity(chunk.len() / 48 + 16);
     let mut pos = 0;
     while pos < chunk.len() {
         let end = memchr(b'\n', &chunk[pos..]).map_or(chunk.len(), |i| pos + i);
@@ -389,9 +429,25 @@ fn parse_clicks(chunk: Bytes, ctx: &Ctx) -> Vec<Vec<Click>> {
             continue;
         }
         let (key, _) = ctx.person(f[1]);
-        out[(key % NPART as u64) as usize].push(Click { person: key, ts, cid, id: f[0] });
+        flat.push(Click { person: key, ts, cid, id: f[0] });
     }
-    out
+    let mut off = [0u32; NPART + 1];
+    for c in &flat {
+        off[(c.person % NPART as u64) as usize + 1] += 1;
+    }
+    for i in 0..NPART {
+        off[i + 1] += off[i];
+    }
+    let mut next = off;
+    let mut recs: Vec<Click> = Vec::with_capacity(flat.len());
+    // SAFETY: every slot in 0..flat.len() is written exactly once by the counting sort below.
+    unsafe { recs.set_len(flat.len()) };
+    for c in &flat {
+        let sh = (c.person % NPART as u64) as usize;
+        recs[next[sh] as usize] = *c;
+        next[sh] += 1;
+    }
+    PClicks { recs, off }
 }
 
 // ------------------------------------------------------------------ links
@@ -773,6 +829,10 @@ fn write_campaigns(path: &Path, rows: &[CampRow]) {
 
 // ------------------------------------------------------------------ main
 
+static T_GATHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_SORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_SCAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn main() {
     let t = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
@@ -839,20 +899,36 @@ fn main() {
 
     // parse events
     let ev_chunks = chunks(&csv_files(&data.join("events")));
-    let parsed: Vec<Vec<Vec<Rec>>> = ev_chunks.par_iter().map(|c| parse_events(c, &ctx)).collect();
+    let parsed: Vec<Parsed> = ev_chunks.par_iter().map(|c| parse_events(c, &ctx)).collect();
     log(&t, "events parsed");
 
     // dedup per shard, re-shard by person
     let deduped: Vec<Vec<Vec<Ev>>> = (0..NSHARD)
         .into_par_iter()
         .map(|s| {
-            let n: usize = parsed.iter().map(|c| c[s].len()).sum();
+            let t0 = Instant::now();
+            let n: usize = parsed.iter().map(|c| c.shard(s).len()).sum();
             let mut all: Vec<Rec> = Vec::with_capacity(n);
             for c in &parsed {
-                all.extend_from_slice(&c[s]);
+                all.extend_from_slice(c.shard(s));
             }
+            let t1 = Instant::now();
             all.sort_unstable_by_key(|r| (r.id, r.ing));
-            let mut parts: Vec<Vec<Ev>> = (0..NPART).map(|_| Vec::new()).collect();
+            let t2 = Instant::now();
+            T_GATHER.fetch_add((t1 - t0).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            T_SORT.fetch_add((t2 - t1).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            let mut cnt = [0u32; NPART];
+            let mut prev: Option<[u64; 2]> = None;
+            for r in &all {
+                if prev == Some(r.id) {
+                    continue;
+                }
+                prev = Some(r.id);
+                if r.ok {
+                    cnt[(r.person % NPART as u64) as usize] += 1;
+                }
+            }
+            let mut parts: Vec<Vec<Ev>> = cnt.iter().map(|&c| Vec::with_capacity(c as usize)).collect();
             let mut prev: Option<[u64; 2]> = None;
             for r in &all {
                 if prev == Some(r.id) {
@@ -870,15 +946,17 @@ fn main() {
                     });
                 }
             }
+            T_SCAT.fetch_add(t2.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             parts
         })
         .collect();
+    eprintln!("gather {} sort {} scatter {} (cpu-ms)", T_GATHER.load(std::sync::atomic::Ordering::Relaxed)/1000, T_SORT.load(std::sync::atomic::Ordering::Relaxed)/1000, T_SCAT.load(std::sync::atomic::Ordering::Relaxed)/1000);
     std::mem::forget(parsed); // freeing thousands of small vectors costs more than it saves
     log(&t, "events deduped");
 
     // parse clicks
     let ck_chunks = chunks(&csv_files(&data.join("clicks")));
-    let click_parts: Vec<Vec<Vec<Click>>> = ck_chunks.par_iter().map(|c| parse_clicks(c, &ctx)).collect();
+    let click_parts: Vec<PClicks> = ck_chunks.par_iter().map(|c| parse_clicks(c, &ctx)).collect();
     log(&t, "clicks parsed");
 
     // per person shard
@@ -897,10 +975,10 @@ fn main() {
             for s in &deduped {
                 evs.extend_from_slice(&s[p]);
             }
-            let m: usize = click_parts.iter().map(|s| s[p].len()).sum();
+            let m: usize = click_parts.iter().map(|s| s.part(p).len()).sum();
             let mut cks = Vec::with_capacity(m);
             for s in &click_parts {
-                cks.extend_from_slice(&s[p]);
+                cks.extend_from_slice(s.part(p));
             }
             process_part(evs, cks, &dims)
         })
