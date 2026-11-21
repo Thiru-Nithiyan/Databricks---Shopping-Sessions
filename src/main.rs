@@ -367,21 +367,70 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 struct Ctx {
     ws: i64,
     we: i64,
-    linked: IdMap<(u64, u64)>, // id hash -> (person key, person name)
     products: HashMap<Bytes, u8>,
     unknown: u8,
     campaigns: HashMap<Bytes, u32>,
 }
 
-impl Ctx {
+/// Linked id hash -> (person key, person name). Open addressing over power-of-two arrays so a
+/// lookup can be prefetched; hash 0 marks an empty slot and is never stored.
+struct LinkTable {
+    mask: usize,
+    keys: Vec<u64>,
+    vals: Vec<(u64, u64)>,
+}
+
+impl LinkTable {
+    fn with_capacity(n: usize) -> LinkTable {
+        let cap = (n * 2).next_power_of_two().max(16);
+        LinkTable { mask: cap - 1, keys: vec![0; cap], vals: vec![(0, 0); cap] }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.iter().filter(|&&k| k != 0).count()
+    }
+
+    fn insert(&mut self, h: u64, v: (u64, u64)) {
+        if h == 0 {
+            return;
+        }
+        let mut i = h as usize & self.mask;
+        while self.keys[i] != 0 && self.keys[i] != h {
+            i = (i + 1) & self.mask;
+        }
+        self.keys[i] = h;
+        self.vals[i] = v;
+    }
+
     #[inline]
-    fn person(&self, uid: Bytes) -> (u64, u64) {
-        let h = xxh3_64(uid);
-        match self.linked.get(&h) {
-            Some(&v) => v,
-            None => (h, pack(uid)),
+    fn get(&self, h: u64) -> Option<(u64, u64)> {
+        let mut i = h as usize & self.mask;
+        loop {
+            let k = unsafe { *self.keys.get_unchecked(i) };
+            if k == h {
+                return if h == 0 { None } else { Some(unsafe { *self.vals.get_unchecked(i) }) };
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
         }
     }
+
+    #[inline]
+    fn prefetch(&self, h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(self.keys.as_ptr().add(h as usize & self.mask) as *const i8, _MM_HINT_T0);
+        }
+    }
+}
+
+/// Person key and name for a user id hash; `fallback` is the packed name of an unlinked id.
+#[inline]
+fn person(linked: &LinkTable, h: u64, fallback: u64) -> (u64, u64) {
+    linked.get(h).unwrap_or((h, fallback))
 }
 
 fn read_manifest(dir: &Path) -> (i64, i64) {
@@ -443,9 +492,9 @@ impl Parsed {
     }
 }
 
-fn parse_events(chunk: Bytes, ctx: &Ctx) -> Parsed {
-    let t0 = Instant::now();
-    let mut flat: Vec<Rec> = Vec::with_capacity(chunk.len() / 56 + 16);
+fn parse_events(chunk: Bytes, ctx: &Ctx, flat: &mut Vec<Rec>) -> Parsed {
+    flat.clear();
+    flat.reserve(chunk.len() / 56 + 16);
     for_each_line::<7>(chunk, |f| {
         if f[0].is_empty() {
             return;
@@ -482,9 +531,8 @@ fn parse_events(chunk: Bytes, ctx: &Ctx) -> Parsed {
             };
         }
         if ok {
-            let (key, name) = ctx.person(f[1]);
-            rec.person = key;
-            rec.name = name;
+            rec.person = xxh3_64(f[1]);
+            rec.name = pack(f[1]);
             rec.cat = *ctx.products.get(f[5]).unwrap_or(&ctx.unknown);
             if et != 2 {
                 rec.price = u32::MAX; // marks a non-purchase
@@ -493,10 +541,8 @@ fn parse_events(chunk: Bytes, ctx: &Ctx) -> Parsed {
         }
         flat.push(rec);
     });
-    let t1 = Instant::now();
-    T_LOOP.fetch_add((t1 - t0).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut off = [0u32; NSHARD + 1];
-    for r in &flat {
+    for r in flat.iter() {
         off[(r.id[0] % NSHARD as u64) as usize + 1] += 1;
     }
     for i in 0..NSHARD {
@@ -506,12 +552,11 @@ fn parse_events(chunk: Bytes, ctx: &Ctx) -> Parsed {
     let mut recs: Vec<Rec> = Vec::with_capacity(flat.len());
     // SAFETY: every slot in 0..flat.len() is written exactly once by the counting sort below.
     unsafe { recs.set_len(flat.len()) };
-    for r in &flat {
+    for r in flat.iter() {
         let sh = (r.id[0] % NSHARD as u64) as usize;
         recs[next[sh] as usize] = *r;
         next[sh] += 1;
     }
-    T_SORT.fetch_add(t1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     Parsed { recs, off }
 }
 
@@ -527,8 +572,9 @@ impl PClicks {
     }
 }
 
-fn parse_clicks(chunk: Bytes, ctx: &Ctx) -> PClicks {
-    let mut flat: Vec<Click> = Vec::with_capacity(chunk.len() / 48 + 16);
+fn parse_clicks(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, flat: &mut Vec<Click>) -> PClicks {
+    flat.clear();
+    flat.reserve(chunk.len() / 48 + 16);
     for_each_line::<4>(chunk, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -538,11 +584,12 @@ fn parse_clicks(chunk: Bytes, ctx: &Ctx) -> PClicks {
         if ts < ctx.ws - WEEK_MS || ts >= ctx.we {
             return;
         }
-        let (key, _) = ctx.person(f[1]);
+        let uh = xxh3_64(f[1]);
+        let (key, _) = person(linked, uh, 0);
         flat.push(Click { person: key, ts, cid, id: f[0] });
     });
     let mut off = [0u32; NPART + 1];
-    for c in &flat {
+    for c in flat.iter() {
         off[(c.person % NPART as u64) as usize + 1] += 1;
     }
     for i in 0..NPART {
@@ -552,7 +599,7 @@ fn parse_clicks(chunk: Bytes, ctx: &Ctx) -> PClicks {
     let mut recs: Vec<Click> = Vec::with_capacity(flat.len());
     // SAFETY: every slot in 0..flat.len() is written exactly once by the counting sort below.
     unsafe { recs.set_len(flat.len()) };
-    for c in &flat {
+    for c in flat.iter() {
         let sh = (c.person % NPART as u64) as usize;
         recs[next[sh] as usize] = *c;
         next[sh] += 1;
@@ -562,7 +609,7 @@ fn parse_clicks(chunk: Bytes, ctx: &Ctx) -> PClicks {
 
 // ------------------------------------------------------------------ links
 
-fn build_links(files: &[PathBuf]) -> IdMap<(u64, u64)> {
+fn build_links(files: &[PathBuf]) -> LinkTable {
     let ch = chunks(files);
     // (hash, name) for both ends of every link, hashed in parallel
     let pairs: Vec<Vec<[(u64, Bytes); 2]>> = ch
@@ -618,7 +665,7 @@ fn build_links(files: &[PathBuf]) -> IdMap<(u64, u64)> {
             }
         }
     }
-    let mut linked: IdMap<(u64, u64)> = IdMap::with_capacity_and_hasher(names.len(), Default::default());
+    let mut linked = LinkTable::with_capacity(names.len());
     // person key per root, computed once
     let mut root_key: Vec<u64> = vec![0; names.len()];
     for i in 0..names.len() {
@@ -664,7 +711,7 @@ struct Dims {
     ncat: usize,
 }
 
-fn process_part(mut evs: Vec<Ev>, mut clicks: Vec<Click>, d: &Dims) -> PartOut {
+fn process_part(evs: &mut [Ev], clicks: &mut [Click], d: &Dims) -> PartOut {
     evs.sort_unstable_by_key(|e| (e.person, e.ts));
     clicks.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.cmp(b.id)));
     let mut out = PartOut {
@@ -939,8 +986,73 @@ fn write_campaigns(path: &Path, rows: &[CampRow]) {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-static T_LOOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static T_SORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Dedup one event-id shard: for every event id keep the copy with the smallest ingest_ts
+/// (equal ones are identical). A kept copy that is invalid drops the event. Returns the
+/// indices of the valid kept copies.
+#[inline(never)]
+fn pick_kept(all: &mut [Rec]) -> Vec<u32> {
+    // the first id word is shared only by copies of one event, or in a freak collision by a few
+    all.sort_unstable_by_key(|r| r.id[0]);
+    let mut kept: Vec<u32> = Vec::with_capacity(all.len());
+    let mut i = 0;
+    while i < all.len() {
+        let mut j = i + 1;
+        while j < all.len() && all[j].id[0] == all[i].id[0] {
+            j += 1;
+        }
+        if j == i + 1 {
+            if all[i].ok {
+                kept.push(i as u32);
+            }
+        } else {
+            for k in i..j {
+                let r = &all[k];
+                if all[i..k].iter().any(|o| o.id == r.id) {
+                    continue;
+                }
+                let best = (k..j).filter(|&m| all[m].id == r.id).min_by_key(|&m| all[m].ing).unwrap();
+                if all[best].ok {
+                    kept.push(best as u32);
+                }
+            }
+        }
+        i = j;
+    }
+    kept
+}
+
+/// Replace the user id hash of every kept record by its person key and name; returns the
+/// number of records per person shard.
+#[inline(never)]
+fn resolve_persons(all: &mut [Rec], kept: &[u32], linked: &LinkTable) -> [u32; NPART] {
+    let mut cnt = [0u32; NPART];
+    for (k, &t) in kept.iter().enumerate() {
+        if let Some(&ahead) = kept.get(k + 32) {
+            linked.prefetch(all[ahead as usize].person);
+        }
+        let r = &mut all[t as usize];
+        (r.person, r.name) = person(linked, r.person, r.name);
+        cnt[(r.person % NPART as u64) as usize] += 1;
+    }
+    cnt
+}
+
+#[inline(never)]
+fn scatter_by_person(all: &[Rec], kept: &[u32], cnt: &[u32; NPART]) -> Vec<Vec<Ev>> {
+    let mut parts: Vec<Vec<Ev>> = cnt.iter().map(|&c| Vec::with_capacity(c as usize)).collect();
+    for &t in kept {
+        let r = &all[t as usize];
+        parts[(r.person % NPART as u64) as usize].push(Ev {
+            person: r.person,
+            name: r.name,
+            ts: r.ts,
+            price: if r.price == u32::MAX { 0 } else { r.price },
+            cat: r.cat,
+            purch: r.price != u32::MAX,
+        });
+    }
+    parts
+}
 
 fn main() {
     let t = Instant::now();
@@ -1002,56 +1114,31 @@ fn main() {
     }
     log(&t, "reference data");
 
-    let linked = build_links(&csv_files(&data.join("links")));
-    log(&t, &format!("links: {} linked ids", linked.len()));
-    let ctx = Ctx { ws, we, linked, products, unknown, campaigns };
+    let ctx = Ctx { ws, we, products, unknown, campaigns };
 
     // parse events
     let ev_chunks = chunks(&csv_files(&data.join("events")));
-    let parsed: Vec<Parsed> = ev_chunks.par_iter().map(|c| parse_events(c, &ctx)).collect();
-    log(&t, "events parsed");
-    eprintln!("parse loop {}ms sort {}ms cpu", T_LOOP.load(std::sync::atomic::Ordering::Relaxed) / 1000, T_SORT.load(std::sync::atomic::Ordering::Relaxed) / 1000);
+    let link_files = csv_files(&data.join("links"));
+    // the link graph is built while the events are parsed; persons are resolved after dedup
+    let (linked, parsed): (LinkTable, Vec<Parsed>) = rayon::join(
+        || build_links(&link_files),
+        || ev_chunks.par_iter().map_init(Vec::new, |flat, c| parse_events(c, &ctx, flat)).collect(),
+    );
+    log(&t, &format!("links and events parsed ({} linked ids)", linked.len()));
 
     // dedup per shard, re-shard by person
     let deduped: Vec<Vec<Vec<Ev>>> = (0..NSHARD)
         .into_par_iter()
-        .map(|s| {
+        .map_init(Vec::new, |all: &mut Vec<Rec>, s| {
             let n: usize = parsed.iter().map(|c| c.shard(s).len()).sum();
-            let mut all: Vec<Rec> = Vec::with_capacity(n);
+            all.clear();
+            all.reserve(n);
             for c in &parsed {
                 all.extend_from_slice(c.shard(s));
             }
-            all.sort_unstable_by_key(|r| (r.id, r.ing));
-            let mut cnt = [0u32; NPART];
-            let mut prev: Option<[u64; 2]> = None;
-            for r in &all {
-                if prev == Some(r.id) {
-                    continue;
-                }
-                prev = Some(r.id);
-                if r.ok {
-                    cnt[(r.person % NPART as u64) as usize] += 1;
-                }
-            }
-            let mut parts: Vec<Vec<Ev>> = cnt.iter().map(|&c| Vec::with_capacity(c as usize)).collect();
-            let mut prev: Option<[u64; 2]> = None;
-            for r in &all {
-                if prev == Some(r.id) {
-                    continue;
-                }
-                prev = Some(r.id);
-                if r.ok {
-                    parts[(r.person % NPART as u64) as usize].push(Ev {
-                        person: r.person,
-                        name: r.name,
-                        ts: r.ts,
-                        price: if r.price == u32::MAX { 0 } else { r.price },
-                        cat: r.cat,
-                        purch: r.price != u32::MAX,
-                    });
-                }
-            }
-            parts
+            let kept = pick_kept(all);
+            let cnt = resolve_persons(all, &kept, &linked);
+            scatter_by_person(all, &kept, &cnt)
         })
         .collect();
     std::mem::forget(parsed); // freeing thousands of small vectors costs more than it saves
@@ -1059,7 +1146,7 @@ fn main() {
 
     // parse clicks
     let ck_chunks = chunks(&csv_files(&data.join("clicks")));
-    let click_parts: Vec<PClicks> = ck_chunks.par_iter().map(|c| parse_clicks(c, &ctx)).collect();
+    let click_parts: Vec<PClicks> = ck_chunks.par_iter().map_init(Vec::new, |flat, c| parse_clicks(c, &ctx, &linked, flat)).collect();
     log(&t, "clicks parsed");
 
     // per person shard
@@ -1072,19 +1159,20 @@ fn main() {
     };
     let parts: Vec<PartOut> = (0..NPART)
         .into_par_iter()
-        .map(|p| {
-            let n: usize = deduped.iter().map(|s| s[p].len()).sum();
-            let mut evs = Vec::with_capacity(n);
-            for s in &deduped {
-                evs.extend_from_slice(&s[p]);
-            }
-            let m: usize = click_parts.iter().map(|s| s.part(p).len()).sum();
-            let mut cks = Vec::with_capacity(m);
-            for s in &click_parts {
-                cks.extend_from_slice(s.part(p));
-            }
-            process_part(evs, cks, &dims)
-        })
+        .map_init(
+            || (Vec::<Ev>::new(), Vec::<Click>::new()),
+            |(evs, cks), p| {
+                evs.clear();
+                for s in &deduped {
+                    evs.extend_from_slice(&s[p]);
+                }
+                cks.clear();
+                for s in &click_parts {
+                    cks.extend_from_slice(s.part(p));
+                }
+                process_part(evs, cks, &dims)
+            },
+        )
         .collect();
     std::mem::forget(deduped);
     std::mem::forget(click_parts);
