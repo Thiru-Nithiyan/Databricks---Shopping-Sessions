@@ -107,18 +107,26 @@ fn fields<const N: usize>(line: Bytes) -> Option<[Bytes; N]> {
     let mut out: [Bytes; N] = [&line[0..0]; N];
     let mut n = 0;
     let mut s = 0;
-    for i in memchr_iter(b',', line) {
-        if n >= N - 1 {
-            return None;
+    let mut quoted = false;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b',' {
+            if n >= N - 1 {
+                return None;
+            }
+            out[n] = &line[s..i];
+            n += 1;
+            s = i + 1;
+        } else if b == b'"' {
+            quoted = true;
         }
-        out[n] = &line[s..i];
-        n += 1;
-        s = i + 1;
     }
     if n != N - 1 {
         return None;
     }
     out[n] = &line[s..];
+    if !quoted {
+        return Some(out);
+    }
     for f in out.iter_mut() {
         if memchr(b'"', f).is_some() {
             let l = f.len();
@@ -133,6 +141,114 @@ fn fields<const N: usize>(line: Bytes) -> Option<[Bytes; N]> {
         }
     }
     Some(out)
+}
+
+/// Positions of every comma, newline and double quote in `buf`, in order.
+fn index_delims(buf: &[u8], out: &mut Vec<u32>) {
+    out.clear();
+    let n = buf.len();
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let comma = _mm_set1_epi8(b',' as i8);
+        let nl = _mm_set1_epi8(b'\n' as i8);
+        let quote = _mm_set1_epi8(b'"' as i8);
+        while i + 64 <= n {
+            let mut mask = 0u64;
+            for k in 0..4 {
+                let v = _mm_loadu_si128(buf.as_ptr().add(i + 16 * k) as *const __m128i);
+                let m = _mm_or_si128(
+                    _mm_or_si128(_mm_cmpeq_epi8(v, comma), _mm_cmpeq_epi8(v, nl)),
+                    _mm_cmpeq_epi8(v, quote),
+                );
+                mask |= (_mm_movemask_epi8(m) as u32 as u64) << (16 * k);
+            }
+            while mask != 0 {
+                out.push((i + mask.trailing_zeros() as usize) as u32);
+                mask &= mask - 1;
+            }
+            i += 64;
+        }
+    }
+    while i < n {
+        let b = buf[i];
+        if b == b',' || b == b'\n' || b == b'"' {
+            out.push(i as u32);
+        }
+        i += 1;
+    }
+}
+
+/// A field with `qc` quotes: unchanged without quotes, unwrapped when one pair wraps it,
+/// otherwise malformed.
+#[inline(always)]
+fn unquote(sub: Bytes, s: usize, e: usize, qc: u32) -> Option<Bytes> {
+    if qc == 0 {
+        Some(&sub[s..e])
+    } else if qc == 2 && e - s >= 2 && sub[s] == b'"' && sub[e - 1] == b'"' {
+        Some(&sub[s + 1..e - 1])
+    } else {
+        None
+    }
+}
+
+/// Calls `f` with the N fields of every well-formed line of `chunk` (a piece that ends on a
+/// line boundary), split from a vectorized index of the delimiters; malformed lines are skipped.
+fn for_each_line<const N: usize>(chunk: Bytes, mut f: impl FnMut([Bytes; N])) {
+    const SUB: usize = 64 << 10;
+    let mut idx: Vec<u32> = Vec::with_capacity(SUB / 8);
+    let mut a = 0;
+    while a < chunk.len() {
+        let mut b = (a + SUB).min(chunk.len());
+        if b < chunk.len() {
+            b = memchr(b'\n', &chunk[b..]).map_or(chunk.len(), |i| b + i + 1);
+        }
+        let sub = &chunk[a..b];
+        a = b;
+        index_delims(sub, &mut idx);
+        let mut ls = 0usize;
+        let mut fs = 0usize;
+        let mut nf = 0usize;
+        let mut qc = 0u32;
+        let mut bad = false;
+        let mut arr: [Bytes; N] = [&sub[0..0]; N];
+        for &p in &idx {
+            let p = p as usize;
+            match sub[p] {
+                b'"' => qc += 1,
+                b',' => {
+                    if nf < N - 1 {
+                        match unquote(sub, fs, p, qc) {
+                            Some(v) => arr[nf] = v,
+                            None => bad = true,
+                        }
+                    }
+                    nf += 1;
+                    fs = p + 1;
+                    qc = 0;
+                }
+                _ => {
+                    if nf == N - 1 && !bad {
+                        if let Some(v) = unquote(sub, fs, p, qc) {
+                            arr[nf] = v;
+                            f(arr);
+                        }
+                    }
+                    ls = p + 1;
+                    fs = ls;
+                    nf = 0;
+                    qc = 0;
+                    bad = false;
+                }
+            }
+        }
+        if ls < sub.len() {
+            if let Some(v) = fields::<N>(&sub[ls..]) {
+                f(v);
+            }
+        }
+    }
 }
 
 #[inline]
@@ -328,15 +444,11 @@ impl Parsed {
 }
 
 fn parse_events(chunk: Bytes, ctx: &Ctx) -> Parsed {
+    let t0 = Instant::now();
     let mut flat: Vec<Rec> = Vec::with_capacity(chunk.len() / 56 + 16);
-    let mut pos = 0;
-    while pos < chunk.len() {
-        let end = memchr(b'\n', &chunk[pos..]).map_or(chunk.len(), |i| pos + i);
-        let line = &chunk[pos..end];
-        pos = end + 1;
-        let Some(f) = fields::<7>(line) else { continue };
+    for_each_line::<7>(chunk, |f| {
         if f[0].is_empty() {
-            continue;
+            return;
         }
         let id = xxh3_128(f[0]);
         let ts = parse_ts(f[2]);
@@ -380,7 +492,9 @@ fn parse_events(chunk: Bytes, ctx: &Ctx) -> Parsed {
             rec.ok = true;
         }
         flat.push(rec);
-    }
+    });
+    let t1 = Instant::now();
+    T_LOOP.fetch_add((t1 - t0).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut off = [0u32; NSHARD + 1];
     for r in &flat {
         off[(r.id[0] % NSHARD as u64) as usize + 1] += 1;
@@ -397,6 +511,7 @@ fn parse_events(chunk: Bytes, ctx: &Ctx) -> Parsed {
         recs[next[sh] as usize] = *r;
         next[sh] += 1;
     }
+    T_SORT.fetch_add(t1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     Parsed { recs, off }
 }
 
@@ -414,23 +529,18 @@ impl PClicks {
 
 fn parse_clicks(chunk: Bytes, ctx: &Ctx) -> PClicks {
     let mut flat: Vec<Click> = Vec::with_capacity(chunk.len() / 48 + 16);
-    let mut pos = 0;
-    while pos < chunk.len() {
-        let end = memchr(b'\n', &chunk[pos..]).map_or(chunk.len(), |i| pos + i);
-        let line = &chunk[pos..end];
-        pos = end + 1;
-        let Some(f) = fields::<4>(line) else { continue };
+    for_each_line::<4>(chunk, |f| {
         if f[0].is_empty() || f[1].is_empty() {
-            continue;
+            return;
         }
-        let Some(&cid) = ctx.campaigns.get(f[2]) else { continue };
-        let Some(ts) = parse_ts(f[3]) else { continue };
+        let Some(&cid) = ctx.campaigns.get(f[2]) else { return };
+        let Some(ts) = parse_ts(f[3]) else { return };
         if ts < ctx.ws - WEEK_MS || ts >= ctx.we {
-            continue;
+            return;
         }
         let (key, _) = ctx.person(f[1]);
         flat.push(Click { person: key, ts, cid, id: f[0] });
-    }
+    });
     let mut off = [0u32; NPART + 1];
     for c in &flat {
         off[(c.person % NPART as u64) as usize + 1] += 1;
@@ -454,30 +564,38 @@ fn parse_clicks(chunk: Bytes, ctx: &Ctx) -> PClicks {
 
 fn build_links(files: &[PathBuf]) -> IdMap<(u64, u64)> {
     let ch = chunks(files);
-    let pairs: Vec<Vec<(Bytes, Bytes)>> = ch
+    // (hash, name) for both ends of every link, hashed in parallel
+    let pairs: Vec<Vec<[(u64, Bytes); 2]>> = ch
         .par_iter()
         .map(|c| {
-            let mut v = vec![];
-            let mut pos = 0;
-            while pos < c.len() {
-                let end = memchr(b'\n', &c[pos..]).map_or(c.len(), |i| pos + i);
-                let line = &c[pos..end];
-                pos = end + 1;
-                if let Some(f) = fields::<2>(line) {
-                    if !f[0].is_empty() && !f[1].is_empty() && f[0] != f[1] {
-                        v.push((f[0], f[1]));
-                    }
+            let mut v = Vec::with_capacity(c.len() / 40 + 4);
+            for_each_line::<2>(c, |f| {
+                if !f[0].is_empty() && !f[1].is_empty() && f[0] != f[1] {
+                    v.push([(xxh3_64(f[0]), f[0]), (xxh3_64(f[1]), f[1])]);
                 }
-            }
+            });
             v
         })
         .collect();
-    let total: usize = pairs.iter().map(|v| v.len()).sum();
-    let mut index: IdMap<u32> = IdMap::with_capacity_and_hasher(total + 16, Default::default());
-    let mut names: Vec<Bytes> = Vec::with_capacity(total + 16);
-    let mut hashes: Vec<u64> = Vec::with_capacity(total + 16);
-    let mut parent: Vec<u32> = Vec::with_capacity(total + 16);
-    let mut min_name: Vec<Bytes> = Vec::with_capacity(total + 16);
+    // dense ids: sort the distinct endpoints by hash
+    let mut ends: Vec<(u64, Bytes)> = Vec::with_capacity(pairs.iter().map(|v| v.len() * 2).sum());
+    for v in &pairs {
+        for e in v {
+            ends.push(e[0]);
+            ends.push(e[1]);
+        }
+    }
+    ends.par_sort_unstable_by_key(|e| e.0);
+    ends.dedup_by_key(|e| e.0);
+    let hashes: Vec<u64> = ends.iter().map(|e| e.0).collect();
+    let names: Vec<Bytes> = ends.iter().map(|e| e.1).collect();
+    drop(ends);
+    let idx = |h: u64| hashes.binary_search(&h).unwrap() as u32;
+    let edges: Vec<Vec<(u32, u32)>> =
+        pairs.par_iter().map(|v| v.iter().map(|e| (idx(e[0].0), idx(e[1].0))).collect()).collect();
+
+    let mut parent: Vec<u32> = (0..names.len() as u32).collect();
+    let mut min_name: Vec<Bytes> = names.clone();
 
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
@@ -488,23 +606,10 @@ fn build_links(files: &[PathBuf]) -> IdMap<(u64, u64)> {
         x
     }
 
-    for v in &pairs {
+    for v in &edges {
         for &(a, b) in v {
-            let mut ids = [0u32; 2];
-            for (k, s) in [a, b].into_iter().enumerate() {
-                let h = xxh3_64(s);
-                let next = names.len() as u32;
-                let id = *index.entry(h).or_insert(next);
-                if id == next {
-                    names.push(s);
-                    hashes.push(h);
-                    parent.push(next);
-                    min_name.push(s);
-                }
-                ids[k] = id;
-            }
-            let ra = find(&mut parent, ids[0]);
-            let rb = find(&mut parent, ids[1]);
+            let ra = find(&mut parent, a);
+            let rb = find(&mut parent, b);
             if ra != rb {
                 parent[rb as usize] = ra;
                 if min_name[rb as usize] < min_name[ra as usize] {
@@ -523,6 +628,8 @@ fn build_links(files: &[PathBuf]) -> IdMap<(u64, u64)> {
         }
         linked.insert(hashes[i], (root_key[r], pack(min_name[r])));
     }
+    std::mem::forget(pairs);
+    std::mem::forget(edges);
     linked
 }
 
@@ -832,6 +939,9 @@ fn write_campaigns(path: &Path, rows: &[CampRow]) {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+static T_LOOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_SORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn main() {
     let t = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
@@ -900,6 +1010,7 @@ fn main() {
     let ev_chunks = chunks(&csv_files(&data.join("events")));
     let parsed: Vec<Parsed> = ev_chunks.par_iter().map(|c| parse_events(c, &ctx)).collect();
     log(&t, "events parsed");
+    eprintln!("parse loop {}ms sort {}ms cpu", T_LOOP.load(std::sync::atomic::Ordering::Relaxed) / 1000, T_SORT.load(std::sync::atomic::Ordering::Relaxed) / 1000);
 
     // dedup per shard, re-shard by person
     let deduped: Vec<Vec<Vec<Ev>>> = (0..NSHARD)
