@@ -9,7 +9,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use hashbrown::HashMap;
@@ -444,6 +444,18 @@ impl LinkTable {
         }
     }
 
+    /// First stage of a lookup ahead of time: bring in the filter word.
+    #[inline]
+    fn prefetch_filter(&self, h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let (w, _) = Self::filter_bit(h);
+            _mm_prefetch(self.filter.as_ptr().add(w) as *const i8, _MM_HINT_T0);
+        }
+    }
+
+    /// Second stage (the filter word is cached by now): bring in the table slot when needed.
     #[inline]
     fn prefetch(&self, h: u64) {
         #[cfg(target_arch = "x86_64")]
@@ -558,6 +570,7 @@ fn group_by<T: Copy>(v: &[T], bucket: impl Fn(&T) -> usize, pos: &mut Vec<u32>) 
     (out, off)
 }
 
+#[inline(never)]
 fn parse_events(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, sc: &mut Scratch) -> EvChunk {
     sc.keys.clear();
     sc.keys.reserve(chunk.len() / 48 + 16);
@@ -606,6 +619,9 @@ fn parse_events(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, sc: &mut Scratch) -
     });
     let n = evs.len();
     for i in 0..n {
+        if i + 32 < n {
+            linked.prefetch_filter(evs[i + 32].person);
+        }
         if i + 16 < n {
             linked.prefetch(evs[i + 16].person);
         }
@@ -652,6 +668,9 @@ fn parse_clicks(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, flat: &mut Vec<Clic
     });
     let n = flat.len();
     for i in 0..n {
+        if i + 32 < n {
+            linked.prefetch_filter(flat[i + 32].person);
+        }
         if i + 16 < n {
             linked.prefetch(flat[i + 16].person);
         }
@@ -858,8 +877,9 @@ struct UserRow {
     top: u8,
 }
 
-struct PartOut {
-    users: Vec<UserRow>,
+/// Campaign totals of one worker thread, summed over the shards it processed.
+#[derive(Default)]
+struct CampAcc {
     credit: Vec<u64>, // [cid][day] x (sessions, purchasing, revenue)
     assist: Vec<u64>, // [cid][day]
 }
@@ -917,14 +937,61 @@ fn gather_bucketed<'a, T: Copy + 'a>(
     off
 }
 
+/// Surviving events of person shard `p`, ordered by (person_order, ts).
+#[inline(never)]
+fn gather_events(parsed: &[EvChunk], p: usize, evs: &mut Vec<Ev>) {
+    let alive = |c: &EvChunk, r: usize| c.dead[r >> 6].load(Relaxed) & (1 << (r & 63)) == 0;
+    let mut off = vec![0u32; NBUCKET + 1];
+    for c in parsed {
+        for r in c.eoff[p] as usize..c.eoff[p + 1] as usize {
+            if alive(c, r) {
+                off[bucket_of(c.evs[r].person) + 1] += 1;
+            }
+        }
+    }
+    for i in 0..NBUCKET {
+        off[i + 1] += off[i];
+    }
+    let n = off[NBUCKET] as usize;
+    evs.clear();
+    evs.reserve(n);
+    // SAFETY: capacity is reserved and the pass below writes every slot of 0..n once.
+    unsafe { evs.set_len(n) };
+    let mut next = off.clone();
+    for c in parsed {
+        for r in c.eoff[p] as usize..c.eoff[p + 1] as usize {
+            if alive(c, r) {
+                let e = c.evs[r];
+                let b = bucket_of(e.person);
+                evs[next[b] as usize] = e;
+                next[b] += 1;
+            }
+        }
+    }
+    for w in off.windows(2) {
+        evs[w[0] as usize..w[1] as usize].sort_unstable_by_key(|e| (e.person, e.ts));
+    }
+}
+
+/// Clicks of person shard `p`, ordered by (person_order, ts, click id).
+#[inline(never)]
+fn gather_clicks(click_parts: &[PClicks], p: usize, cks: &mut Vec<Click>) {
+    let coff = gather_bucketed(click_parts.iter().map(|s| s.part(p)), cks, |c| bucket_of(c.person));
+    for w in coff.windows(2) {
+        cks[w[0] as usize..w[1] as usize]
+            .sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.cmp(b.id)));
+    }
+}
+
 /// Sessions, credit and assists of one person shard. `evs` is ordered by (person_order, ts) and
 /// `clicks` by (person_order, ts, click id).
-fn process_part(evs: &[Ev], clicks: &[Click], d: &Dims) -> PartOut {
-    let mut out = PartOut {
-        users: vec![],
-        credit: vec![0; d.ncid * d.ndays * 3],
-        assist: vec![0; d.ncid * d.ndays],
-    };
+#[inline(never)]
+fn process_part(evs: &[Ev], clicks: &[Click], d: &Dims, out: &mut CampAcc) -> Vec<UserRow> {
+    if out.credit.is_empty() {
+        out.credit = vec![0; d.ncid * d.ndays * 3];
+        out.assist = vec![0; d.ncid * d.ndays];
+    }
+    let mut users: Vec<UserRow> = vec![];
     let mut sess: Vec<Sess> = vec![];
     let mut catsum = vec![0u64; d.ncat];
     let mut touched: Vec<u8> = vec![];
@@ -958,7 +1025,7 @@ fn process_part(evs: &[Ev], clicks: &[Click], d: &Dims) -> PartOut {
                         catsum[c as usize] = 0;
                     }
                     touched.clear();
-                    out.users.push(UserRow {
+                    users.push(UserRow {
                         name,
                         day: cur_day as i32,
                         sessions: d_sess,
@@ -1085,7 +1152,7 @@ fn process_part(evs: &[Ev], clicks: &[Click], d: &Dims) -> PartOut {
         }
         i = j;
     }
-    out
+    users
 }
 
 // ------------------------------------------------------------------ parquet output
@@ -1104,6 +1171,7 @@ fn ba(s: &[u8]) -> ByteArray {
     ByteArray::from(s.to_vec())
 }
 
+#[inline(never)]
 fn write_users(path: &Path, rows: &[UserRow], cats: &[Bytes]) {
     let schema = Arc::new(
         parse_message_type(
@@ -1246,6 +1314,33 @@ fn dedup_shard(g: &[GKey], table: &mut Vec<u64>, chunks: &[EvChunk]) {
     }
 }
 
+/// Scratch buffers of one worker thread, kept for the whole run: fresh memory is expensive to
+/// fault in, and rayon's `map_init` would rebuild its state for every split job.
+#[derive(Default)]
+struct Bufs {
+    ev: Scratch,
+    clicks: Vec<Click>,
+    g: Vec<GKey>,
+    table: Vec<u64>,
+    pevs: Vec<Ev>,
+    pcks: Vec<Click>,
+    camp: CampAcc,
+}
+
+struct Pool(Vec<Mutex<Bufs>>);
+
+impl Pool {
+    fn new() -> Pool {
+        Pool((0..rayon::current_num_threads() + 1).map(|_| Mutex::new(Bufs::default())).collect())
+    }
+
+    /// Run `f` with this thread's buffers (no rayon calls may happen inside `f`).
+    fn with<R>(&self, f: impl FnOnce(&mut Bufs) -> R) -> R {
+        let i = rayon::current_thread_index().unwrap_or(self.0.len() - 1);
+        f(&mut self.0[i].lock().unwrap())
+    }
+}
+
 fn main() {
     let t = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
@@ -1311,28 +1406,30 @@ fn main() {
     let linked = build_links(&csv_files(&data.join("links")));
     log(&t, &format!("links: {} linked ids", linked.len()));
 
+    let pool = Pool::new();
+
     // parse events
     let ev_chunks = chunks(&csv_files(&data.join("events")));
     let parsed: Vec<EvChunk> =
-        ev_chunks.par_iter().map_init(Scratch::default, |sc, c| parse_events(c, &ctx, &linked, sc)).collect();
+        ev_chunks.par_iter().map(|c| pool.with(|b| parse_events(c, &ctx, &linked, &mut b.ev))).collect();
     log(&t, "events parsed");
 
     // dedup per event-id shard
-    (0..NSHARD).into_par_iter().for_each_init(
-        || (Vec::<GKey>::new(), Vec::<u64>::new()),
-        |(g, table), s| {
+    (0..NSHARD).into_par_iter().for_each(|s| {
+        pool.with(|b| {
+            let (g, table) = (&mut b.g, &mut b.table);
             g.clear();
             for (ci, c) in parsed.iter().enumerate() {
                 g.extend(c.shard(s).iter().map(|k| GKey { id0: k.id0, ing: k.ing, id1: k.id1, rec: k.rec, chunk: ci as u32 }));
             }
             dedup_shard(g, table, &parsed);
-        },
-    );
+        })
+    });
     log(&t, "events deduped");
 
     // parse clicks
     let ck_chunks = chunks(&csv_files(&data.join("clicks")));
-    let click_parts: Vec<PClicks> = ck_chunks.par_iter().map_init(Vec::new, |flat, c| parse_clicks(c, &ctx, &linked, flat)).collect();
+    let click_parts: Vec<PClicks> = ck_chunks.par_iter().map(|c| pool.with(|b| parse_clicks(c, &ctx, &linked, &mut b.clicks))).collect();
     log(&t, "clicks parsed");
 
     let ud = out.join("user_daily");
@@ -1348,67 +1445,34 @@ fn main() {
         ncid: camp_names.len(),
         ncat: cat_names.len(),
     };
-    let parts: Vec<PartOut> = (0..NPART)
+    (0..NPART)
         .into_par_iter()
-        .map_init(
-            || (Vec::<Ev>::new(), Vec::<Click>::new()),
-            |(evs, cks), p| {
-                // surviving events of this shard, bucketed while gathered
-                let alive = |c: &EvChunk, r: usize| c.dead[r >> 6].load(Relaxed) & (1 << (r & 63)) == 0;
-                let mut off = vec![0u32; NBUCKET + 1];
-                for c in &parsed {
-                    for r in c.eoff[p] as usize..c.eoff[p + 1] as usize {
-                        if alive(c, r) {
-                            off[bucket_of(c.evs[r].person) + 1] += 1;
-                        }
-                    }
+        .for_each(|p| {
+            pool.with(|b| {
+                let (evs, cks) = (&mut b.pevs, &mut b.pcks);
+                gather_events(&parsed, p, evs);
+                gather_clicks(&click_parts, p, cks);
+                let users = process_part(evs, cks, &dims, &mut b.camp);
+                if !users.is_empty() || p == 0 {
+                    write_users(&ud.join(format!("part-{p}.parquet")), &users, &cat_names);
                 }
-                for i in 0..NBUCKET {
-                    off[i + 1] += off[i];
-                }
-                let n = off[NBUCKET] as usize;
-                evs.clear();
-                evs.reserve(n);
-                // SAFETY: capacity is reserved and the pass below writes every slot of 0..n once.
-                unsafe { evs.set_len(n) };
-                let mut next = off.clone();
-                for c in &parsed {
-                    for r in c.eoff[p] as usize..c.eoff[p + 1] as usize {
-                        if alive(c, r) {
-                            let e = c.evs[r];
-                            let b = bucket_of(e.person);
-                            evs[next[b] as usize] = e;
-                            next[b] += 1;
-                        }
-                    }
-                }
-                for w in off.windows(2) {
-                    evs[w[0] as usize..w[1] as usize].sort_unstable_by_key(|e| (e.person, e.ts));
-                }
-                let coff = gather_bucketed(click_parts.iter().map(|s| s.part(p)), cks, |c| bucket_of(c.person));
-                for w in coff.windows(2) {
-                    cks[w[0] as usize..w[1] as usize]
-                        .sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.cmp(b.id)));
-                }
-                let o = process_part(evs, cks, &dims);
-                if !o.users.is_empty() || p == 0 {
-                    write_users(&ud.join(format!("part-{p}.parquet")), &o.users, &cat_names);
-                }
-                o
-            },
-        )
-        .collect();
+            })
+        });
     std::mem::forget(parsed); // freeing thousands of vectors costs more than it saves
     std::mem::forget(click_parts);
     log(&t, "sessions, credit and assists done");
 
     // campaign output (user parts were written per shard)
+    let accs: Vec<CampAcc> = pool.0.into_iter().map(|m| m.into_inner().unwrap().camp).collect();
     let mut rows: Vec<CampRow> = vec![];
     let nd = dims.ndays;
     for cid in 0..dims.ncid {
         for di in 0..nd {
             let mut v = [0u64; 4];
-            for o in &parts {
+            for o in &accs {
+                if o.credit.is_empty() {
+                    continue;
+                }
                 let k = (cid * nd + di) * 3;
                 v[0] += o.credit[k];
                 v[1] += o.credit[k + 1];
