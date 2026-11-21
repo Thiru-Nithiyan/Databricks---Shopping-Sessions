@@ -9,17 +9,12 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use hashbrown::HashMap;
 use memchr::memchr;
 use memmap2::Mmap;
-use parquet::basic::Compression;
-use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::parser::parse_message_type;
 use rayon::prelude::*;
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
@@ -27,8 +22,9 @@ const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const GAP_MS: i64 = 1_800_000;
 const NSHARD: usize = 256; // event-id shards (dedup)
-const NPART: usize = 256; // person shards (group_by assumes both are 256)
-const CHUNK: usize = 8 << 20;
+const NPART: usize = 256; // person shards
+const CHUNK: usize = 8 << 20; // events
+const SMALL_CHUNK: usize = 1 << 20; // clicks and links: fewer, unevenly sized files
 const NO_CAT: u8 = 255;
 
 type Bytes = &'static [u8];
@@ -63,7 +59,7 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Split every file (header skipped) into pieces that end on a line boundary.
-fn chunks(files: &[PathBuf]) -> Vec<Bytes> {
+fn chunks(files: &[PathBuf], size: usize) -> Vec<Bytes> {
     let mut out = vec![];
     for p in files {
         let data = load(p);
@@ -72,7 +68,7 @@ fn chunks(files: &[PathBuf]) -> Vec<Bytes> {
             None => continue,
         };
         while start < data.len() {
-            let mut end = (start + CHUNK).min(data.len());
+            let mut end = (start + size).min(data.len());
             if end < data.len() {
                 end = match memchr(b'\n', &data[end..]) {
                     Some(i) => end + i + 1,
@@ -246,13 +242,37 @@ fn unpack(v: u64) -> Bytes {
     unsafe { std::slice::from_raw_parts((v & ((1u64 << 48) - 1)) as *const u8, (v >> 48) as usize) }
 }
 
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+const TABLE_Y0: i64 = 1970;
+const TABLE_YEARS: usize = 131;
+
+/// Day number of the first of every month from 1970 to 2100.
+static MONTH_START: [i64; TABLE_YEARS * 12] = {
+    let mut t = [0i64; TABLE_YEARS * 12];
+    let mut i = 0;
+    while i < TABLE_YEARS * 12 {
+        t[i] = days_from_civil(TABLE_Y0 + (i / 12) as i64, (i % 12) as i64 + 1, 1);
+        i += 1;
+    }
+    t
+};
+
+#[inline]
+fn days_of(y: i64, m: i64, d: i64) -> i64 {
+    let k = (y - TABLE_Y0) * 12 + m - 1;
+    if (0..(TABLE_YEARS * 12) as i64).contains(&k) {
+        MONTH_START[k as usize] + d - 1
+    } else {
+        days_from_civil(y, m, d)
+    }
 }
 
 #[inline]
@@ -273,7 +293,22 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     if (n == 20 || n == 25) && s[4] == b'-' {
         return parse_iso(s);
     }
-    if n == 0 || !s.iter().all(|b| b.is_ascii_digit()) {
+    if n == 0 {
+        return None;
+    }
+    if n <= 18 {
+        // cannot overflow
+        let mut v: i64 = 0;
+        for &b in s {
+            let d = b.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as i64;
+        }
+        return Some(v);
+    }
+    if !s.iter().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let mut v: i64 = 0;
@@ -285,14 +320,17 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
 
 /// `YYYY-MM-DDTHH:MM:SSZ` or `YYYY-MM-DDTHH:MM:SS+HH:MM` (length 20 or 25, `-` at 4).
 fn parse_iso(s: &[u8]) -> Option<i64> {
-    let n = s.len();
-    if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    Some(iso_date(s)? * DAY_MS + iso_time(s)?)
+}
+
+/// Day number of the `YYYY-MM-DD` part (bytes 0..10), None when it is not a real date.
+fn iso_date(s: &[u8]) -> Option<i64> {
+    if s[7] != b'-' {
         return None;
     }
-    const POS: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
-    let mut d = [0i64; 14];
+    let mut d = [0i64; 8];
     let mut bad = false;
-    for (k, &p) in POS.iter().enumerate() {
+    for (k, &p) in [0, 1, 2, 3, 5, 6, 8, 9].iter().enumerate() {
         let x = s[p].wrapping_sub(b'0');
         bad |= x > 9;
         d[k] = x as i64;
@@ -303,10 +341,7 @@ fn parse_iso(s: &[u8]) -> Option<i64> {
     let y = d[0] * 1000 + d[1] * 100 + d[2] * 10 + d[3];
     let mo = d[4] * 10 + d[5];
     let dd = d[6] * 10 + d[7];
-    let h = d[8] * 10 + d[9];
-    let mi = d[10] * 10 + d[11];
-    let se = d[12] * 10 + d[13];
-    if !(1..=12).contains(&mo) || dd < 1 || h > 23 || mi > 59 || se > 59 {
+    if !(1..=12).contains(&mo) || dd < 1 {
         return None;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
@@ -316,6 +351,22 @@ fn parse_iso(s: &[u8]) -> Option<i64> {
         _ => 31,
     };
     if dd > dim {
+        return None;
+    }
+    Some(days_of(y, mo, dd))
+}
+
+/// Ms since midnight UTC of the `THH:MM:SS` part plus its `Z` or `+HH:MM` offset.
+#[inline]
+fn iso_time(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        return None;
+    }
+    let h = dig2(s, 11)?;
+    let mi = dig2(s, 14)?;
+    let se = dig2(s, 17)?;
+    if h > 23 || mi > 59 || se > 59 {
         return None;
     }
     let off = if n == 20 {
@@ -339,7 +390,42 @@ fn parse_iso(s: &[u8]) -> Option<i64> {
         }
         sign * (oh * 3_600_000 + om * 60_000)
     };
-    Some(days_from_civil(y, mo, dd) * DAY_MS + h * 3_600_000 + mi * 60_000 + se * 1000 - off)
+    Some(h * 3_600_000 + mi * 60_000 + se * 1000 - off)
+}
+
+/// `parse_ts` with a small exact cache of ISO dates: a dataset spans only a few weeks.
+struct TsParser {
+    k1: [u64; 64],
+    k2: [u16; 64],
+    day: [i64; 64], // i64::MIN: not a date
+}
+
+impl TsParser {
+    fn new() -> TsParser {
+        TsParser { k1: [0; 64], k2: [0; 64], day: [i64::MIN; 64] }
+    }
+
+    #[inline]
+    fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        let n = s.len();
+        if !((n == 20 || n == 25) && s[4] == b'-') {
+            return parse_ts(s);
+        }
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let b = u16::from_le_bytes(s[8..10].try_into().unwrap());
+        let i = ((a ^ (b as u64) << 48).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58) as usize;
+        let day = if self.k1[i] == a && self.k2[i] == b {
+            self.day[i]
+        } else {
+            let d = iso_date(s).unwrap_or(i64::MIN);
+            (self.k1[i], self.k2[i], self.day[i]) = (a, b, d);
+            d
+        };
+        if day == i64::MIN {
+            return None;
+        }
+        Some(day * DAY_MS + iso_time(s)?)
+    }
 }
 
 fn parse_price(s: &[u8]) -> Option<u32> {
@@ -415,6 +501,7 @@ impl ProdTable {
 struct Ctx {
     ws: i64,
     we: i64,
+    base: i64,
     products: ProdTable,
     unknown: u8,
     campaigns: HashMap<Bytes, u32>,
@@ -425,6 +512,7 @@ struct Ctx {
 /// filter answers most lookups of unlinked ids without touching the table.
 struct LinkTable {
     mask: usize,
+    shift: u32,
     keys: Vec<u64>,
     vals: Vec<(u64, u64)>,
     filter: Vec<u64>,
@@ -437,6 +525,7 @@ impl LinkTable {
         let cap = (n + n / 2).next_power_of_two().max(16);
         LinkTable {
             mask: cap - 1,
+            shift: 64 - cap.trailing_zeros(),
             keys: vec![0; cap],
             vals: vec![(0, 0); cap],
             filter: vec![0; 1 << (FILTER_BITS - 6)],
@@ -445,8 +534,14 @@ impl LinkTable {
 
     #[inline]
     fn filter_bit(h: u64) -> (usize, u64) {
-        let b = (h >> (64 - FILTER_BITS)) as usize; // the table slot uses the low bits
+        let b = (h & ((1 << FILTER_BITS) - 1)) as usize; // the table slot uses the high bits
         (b >> 6, 1u64 << (b & 63))
+    }
+
+    /// Home slot: the high bits, so inserting in hash order walks the table in order.
+    #[inline]
+    fn slot(&self, h: u64) -> usize {
+        (h >> self.shift) as usize
     }
 
     #[inline]
@@ -465,7 +560,7 @@ impl LinkTable {
         }
         let (w, m) = Self::filter_bit(h);
         self.filter[w] |= m;
-        let mut i = h as usize & self.mask;
+        let mut i = self.slot(h);
         while self.keys[i] != 0 && self.keys[i] != h {
             i = (i + 1) & self.mask;
         }
@@ -478,7 +573,7 @@ impl LinkTable {
         if h == 0 || !self.maybe(h) {
             return None;
         }
-        let mut i = h as usize & self.mask;
+        let mut i = self.slot(h);
         loop {
             let k = unsafe { *self.keys.get_unchecked(i) };
             if k == h {
@@ -509,7 +604,7 @@ impl LinkTable {
         if self.maybe(h) {
             unsafe {
                 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                let i = h as usize & self.mask;
+                let i = self.slot(h);
                 _mm_prefetch(self.keys.as_ptr().add(i) as *const i8, _MM_HINT_T0);
                 _mm_prefetch(self.vals.as_ptr().add(i) as *const i8, _MM_HINT_T0);
             }
@@ -552,22 +647,38 @@ struct Key {
     thread: u8,
 }
 
+/// A valid event. Times are ms offsets from `Ctx::base` (window_start - 7 days), so event and
+/// click times compare directly; `pc` is price_cents << 8 | category (price 0: not a purchase).
 #[derive(Clone, Copy, Default)]
 struct Ev {
     person: u64,
     name: u64,
-    ts: i64,
-    price: u32,
-    cat: u8,
-    purch: bool,
+    ts: u32,
+    pc: u32,
 }
 
-#[derive(Clone, Copy)]
+impl Ev {
+    #[inline]
+    fn price(&self) -> u64 {
+        (self.pc >> 8) as u64
+    }
+    #[inline]
+    fn cat(&self) -> u8 {
+        self.pc as u8
+    }
+    #[inline]
+    fn purch(&self) -> bool {
+        self.pc >= 256
+    }
+}
+
+/// A valid click; `id` is the packed click id, `ts` an offset from `Ctx::base`.
+#[derive(Clone, Copy, Default)]
 struct Click {
     person: u64,
-    ts: i64,
+    id: u64,
+    ts: u32,
     cid: u32,
-    id: Bytes,
 }
 
 /// Everything one worker thread parsed: valid events by person shard and dedup keys of all
@@ -578,10 +689,11 @@ struct ThreadOut {
 }
 
 impl ThreadOut {
-    fn new(per_part: usize) -> ThreadOut {
+    /// `per_thread`: expected events parsed by one thread.
+    fn new(per_thread: usize) -> ThreadOut {
         ThreadOut {
-            evs: (0..NPART).map(|_| Vec::with_capacity(per_part)).collect(),
-            keys: (0..NSHARD).map(|_| Vec::with_capacity(per_part * 9 / 8)).collect(),
+            evs: (0..NPART).map(|_| Vec::with_capacity(per_thread / NPART + 64)).collect(),
+            keys: (0..NSHARD).map(|_| Vec::with_capacity(per_thread * 9 / 8 / NSHARD + 64)).collect(),
         }
     }
 }
@@ -639,13 +751,14 @@ impl Pipe {
 #[inline(never)]
 fn parse_events(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, out: &mut ThreadOut, tid: u8) {
     let mut pipe = Pipe::new();
+    let mut tsp = TsParser::new();
     for_each_line::<7>(chunk, |f| {
         if f[0].is_empty() {
             return;
         }
         let id = xxh3_128(f[0]);
-        let ts = parse_ts(f[2]);
-        let ing = parse_ts(f[3]);
+        let ts = tsp.parse(f[2]);
+        let ing = tsp.parse(f[3]);
         let key = Key {
             id0: id as u64,
             ing: ing.unwrap_or(i64::MAX),
@@ -674,13 +787,12 @@ fn parse_events(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, out: &mut ThreadOut
             };
         }
         if ok {
+            let cat = ctx.products.get(f[5]).unwrap_or(ctx.unknown);
             let ev = Ev {
                 person: xxh3_64(f[1]), // the user id hash until the pipe resolves the person
                 name: pack(f[1]),
-                ts: ts.unwrap(),
-                price,
-                cat: ctx.products.get(f[5]).unwrap_or(ctx.unknown),
-                purch: et == 2,
+                ts: (ts.unwrap() - ctx.base) as u32,
+                pc: price << 8 | cat as u32,
             };
             pipe.push(ev, key, linked, out, tid);
         } else {
@@ -705,16 +817,17 @@ impl PClicks {
 fn parse_clicks(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, flat: &mut Vec<Click>) -> PClicks {
     flat.clear();
     flat.reserve(chunk.len() / 48 + 16);
+    let mut tsp = TsParser::new();
     for_each_line::<4>(chunk, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
         let Some(&cid) = ctx.campaigns.get(f[2]) else { return };
-        let Some(ts) = parse_ts(f[3]) else { return };
+        let Some(ts) = tsp.parse(f[3]) else { return };
         if ts < ctx.ws - WEEK_MS || ts >= ctx.we {
             return;
         }
-        flat.push(Click { person: xxh3_64(f[1]), ts, cid, id: f[0] }); // user id hash for now
+        flat.push(Click { person: xxh3_64(f[1]), id: pack(f[0]), ts: (ts - ctx.base) as u32, cid }); // user id hash for now
     });
     let n = flat.len();
     for i in 0..n {
@@ -799,7 +912,7 @@ fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
 }
 
 fn build_links(files: &[PathBuf]) -> LinkTable {
-    let ch = chunks(files);
+    let ch = chunks(files, SMALL_CHUNK);
     let pairs: Vec<Vec<[(u64, Bytes); 2]>> = ch
         .par_iter()
         .map(|c| {
@@ -880,7 +993,7 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
     // the table, filled in parallel
     let mut linked = LinkTable::with_capacity(n);
     {
-        let mask = linked.mask;
+        let (mask, shift) = (linked.mask, linked.shift);
         let keys_a = atomics(&mut linked.keys);
         let filter_a = atomics(&mut linked.filter);
         let vals = SyncPtr(linked.vals.as_mut_ptr());
@@ -892,7 +1005,7 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
             let (w, bit) = LinkTable::filter_bit(h);
             filter_a[w].fetch_or(bit, Relaxed);
             let nm = names[best[root[i] as usize].load(Relaxed) as usize];
-            let mut j = h as usize & mask;
+            let mut j = (h >> shift) as usize;
             loop {
                 match keys_a[j].compare_exchange(0, h, Relaxed, Relaxed) {
                     Ok(_) => {
@@ -935,6 +1048,7 @@ struct CampAcc {
 }
 
 struct Dims {
+    base: i64,
     min_day: i64,
     ndays: usize,
     ncid: usize,
@@ -1028,7 +1142,7 @@ fn gather_clicks(click_parts: &[PClicks], p: usize, cks: &mut Vec<Click>) {
     let coff = gather_bucketed(click_parts.iter().map(|s| s.part(p)), cks, |c| bucket_of(c.person));
     for w in coff.windows(2) {
         cks[w[0] as usize..w[1] as usize]
-            .sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.cmp(b.id)));
+            .sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| unpack(a.id).cmp(unpack(b.id))));
     }
 }
 
@@ -1090,27 +1204,29 @@ fn process_part(evs: &[Ev], clicks: &[Click], d: &Dims, out: &mut CampAcc) -> Ve
         }
 
         for e in &evs[i..j] {
-            if sess.is_empty() || e.ts - prev_ts > GAP_MS {
-                let day = e.ts.div_euclid(DAY_MS);
+            let ts = e.ts as i64;
+            if sess.is_empty() || ts - prev_ts > GAP_MS {
+                let day = (d.base + ts).div_euclid(DAY_MS);
                 if day != cur_day {
                     flush!();
                     cur_day = day;
                 }
                 d_sess += 1;
-                sess.push(Sess { start: e.ts, di: (day - d.min_day) as usize, rev: 0, purch: 0 });
+                sess.push(Sess { start: ts, di: (day - d.min_day) as usize, rev: 0, purch: 0 });
             }
-            prev_ts = e.ts;
+            prev_ts = ts;
             d_events += 1;
-            if e.purch {
-                let p = e.price as u64;
+            if e.purch() {
+                let p = e.price();
                 d_rev += p;
                 let s = sess.last_mut().unwrap();
                 s.rev += p;
                 s.purch += 1;
-                if catsum[e.cat as usize] == 0 {
-                    touched.push(e.cat);
+                let c = e.cat();
+                if catsum[c as usize] == 0 {
+                    touched.push(c);
                 }
-                catsum[e.cat as usize] += p;
+                catsum[c as usize] += p;
             }
         }
         flush!();
@@ -1129,15 +1245,15 @@ fn process_part(evs: &[Ev], clicks: &[Click], d: &Dims, out: &mut CampAcc) -> Ve
         // credit
         let mut q = 0usize;
         for s in &sess {
-            while q < cl.len() && cl[q].ts <= s.start {
+            while q < cl.len() && cl[q].ts as i64 <= s.start {
                 q += 1;
             }
             let mut cid = 0usize;
             if q > 0 {
-                let t = cl[q - 1].ts;
+                let t = cl[q - 1].ts as i64;
                 if s.start - t <= WEEK_MS {
                     let mut g = q - 1;
-                    while g > 0 && cl[g - 1].ts == t {
+                    while g > 0 && cl[g - 1].ts as i64 == t {
                         g -= 1;
                     }
                     cid = cl[g].cid as usize;
@@ -1162,7 +1278,7 @@ fn process_part(evs: &[Ev], clicks: &[Click], d: &Dims, out: &mut CampAcc) -> Ve
                 a = b;
             }
             cts.clear();
-            cts.extend(cl.iter().map(|c| (c.cid, c.ts)));
+            cts.extend(cl.iter().map(|c| (c.cid, c.ts as i64)));
             cts.sort_unstable();
             let mut k = 0;
             while k < cts.len() {
@@ -1206,67 +1322,243 @@ fn process_part(evs: &[Ev], clicks: &[Click], d: &Dims, out: &mut CampAcc) -> Ve
 
 // ------------------------------------------------------------------ parquet output
 
-fn props() -> Arc<WriterProperties> {
-    Arc::new(
-        WriterProperties::builder()
-            .set_compression(Compression::UNCOMPRESSED)
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::None)
-            .build(),
-    )
+/// Thrift compact-protocol encoder, just enough for Parquet page headers and the footer.
+struct Thrift {
+    b: Vec<u8>,
+    cur: i16,
+    stack: Vec<i16>,
 }
 
-fn ba(s: &[u8]) -> ByteArray {
-    ByteArray::from(s.to_vec())
+impl Thrift {
+    const I32: u8 = 5;
+    const I64: u8 = 6;
+    const BIN: u8 = 8;
+    const LIST: u8 = 9;
+    const STRUCT: u8 = 12;
+
+    fn new() -> Thrift {
+        Thrift { b: Vec::new(), cur: 0, stack: Vec::new() }
+    }
+
+    fn varint(&mut self, mut v: u64) {
+        while v >= 0x80 {
+            self.b.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        self.b.push(v as u8);
+    }
+
+    fn field(&mut self, id: i16, ty: u8) {
+        let d = id - self.cur;
+        if d > 0 && d <= 15 {
+            self.b.push((d as u8) << 4 | ty);
+        } else {
+            self.b.push(ty);
+            self.varint(((id << 1) ^ (id >> 15)) as u16 as u64);
+        }
+        self.cur = id;
+    }
+
+    fn i32(&mut self, id: i16, v: i32) {
+        self.field(id, Self::I32);
+        self.varint(((v << 1) ^ (v >> 31)) as u32 as u64);
+    }
+
+    fn i64(&mut self, id: i16, v: i64) {
+        self.field(id, Self::I64);
+        self.varint(((v << 1) ^ (v >> 63)) as u64);
+    }
+
+    fn bin(&mut self, id: i16, s: &[u8]) {
+        self.field(id, Self::BIN);
+        self.varint(s.len() as u64);
+        self.b.extend_from_slice(s);
+    }
+
+    fn list(&mut self, id: i16, elem: u8, n: usize) {
+        self.field(id, Self::LIST);
+        if n < 15 {
+            self.b.push((n as u8) << 4 | elem);
+        } else {
+            self.b.push(0xf0 | elem);
+            self.varint(n as u64);
+        }
+    }
+
+    /// Start a struct: a field (`Some(id)`) or a list element (`None`).
+    fn begin(&mut self, id: Option<i16>) {
+        if let Some(id) = id {
+            self.field(id, Self::STRUCT);
+        }
+        self.stack.push(self.cur);
+        self.cur = 0;
+    }
+
+    fn end(&mut self) {
+        self.b.push(0);
+        self.cur = self.stack.pop().unwrap_or(0);
+    }
 }
 
-/// A string that lives for the whole run (mapped input), passed without a copy.
-fn ba_static(s: Bytes) -> ByteArray {
-    ByteArray::from(bytes::Bytes::from_static(s))
+/// One output column.
+enum Col<'a> {
+    Str(&'static str, Vec<&'a [u8]>),
+    OptStr(&'static str, Vec<Option<&'a [u8]>>),
+    Date(&'static str, Vec<i32>),
+    I64(&'static str, Vec<i64>),
+}
+
+impl Col<'_> {
+    fn name(&self) -> &'static str {
+        match self {
+            Col::Str(n, _) | Col::OptStr(n, _) | Col::Date(n, _) | Col::I64(n, _) => n,
+        }
+    }
+
+    /// (physical type, converted type, optional)
+    fn kind(&self) -> (i32, Option<i32>, bool) {
+        match self {
+            Col::Str(..) => (6, Some(0), false), // BYTE_ARRAY, UTF8
+            Col::OptStr(..) => (6, Some(0), true),
+            Col::Date(..) => (1, Some(6), false), // INT32, DATE
+            Col::I64(..) => (2, None, false),     // INT64
+        }
+    }
+
+    /// Plain-encoded page body (definition levels first for the optional column).
+    fn page(&self, out: &mut Vec<u8>) {
+        match self {
+            Col::Str(_, v) => {
+                for s in v {
+                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    out.extend_from_slice(s);
+                }
+            }
+            Col::OptStr(_, v) => {
+                // definition levels: one bit-packed run of bit width 1, length-prefixed
+                let groups = v.len().div_ceil(8);
+                let mut lv = Thrift::new();
+                lv.varint(((groups as u64) << 1) | 1);
+                let mut bits = vec![0u8; groups];
+                for (i, s) in v.iter().enumerate() {
+                    if s.is_some() {
+                        bits[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                lv.b.extend_from_slice(&bits);
+                out.extend_from_slice(&(lv.b.len() as u32).to_le_bytes());
+                out.extend_from_slice(&lv.b);
+                for s in v.iter().flatten() {
+                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    out.extend_from_slice(s);
+                }
+            }
+            Col::Date(_, v) => {
+                for x in v {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            Col::I64(_, v) => {
+                for x in v {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// Write `cols` (each `rows` long) as one Parquet file: one row group, one plain, uncompressed
+/// data page per column.
+fn write_parquet(path: &Path, rows: usize, cols: &[Col]) {
+    let mut f: Vec<u8> = Vec::with_capacity(64 + rows * 64);
+    f.extend_from_slice(b"PAR1");
+    let mut chunks: Vec<(i64, i64)> = vec![]; // (page offset, chunk size)
+    if rows > 0 {
+        let mut body = Vec::new();
+        for c in cols {
+            body.clear();
+            c.page(&mut body);
+            let mut h = Thrift::new();
+            h.i32(1, 0); // DATA_PAGE
+            h.i32(2, body.len() as i32);
+            h.i32(3, body.len() as i32);
+            h.begin(Some(5));
+            h.i32(1, rows as i32);
+            h.i32(2, 0); // PLAIN
+            h.i32(3, 3); // RLE
+            h.i32(4, 3); // RLE
+            h.end();
+            h.b.push(0);
+            let off = f.len() as i64;
+            f.extend_from_slice(&h.b);
+            f.extend_from_slice(&body);
+            chunks.push((off, f.len() as i64 - off));
+        }
+    }
+    let mut m = Thrift::new();
+    m.i32(1, 1);
+    m.list(2, Thrift::STRUCT, cols.len() + 1);
+    m.begin(None);
+    m.bin(4, b"schema");
+    m.i32(5, cols.len() as i32);
+    m.end();
+    for c in cols {
+        let (ty, conv, opt) = c.kind();
+        m.begin(None);
+        m.i32(1, ty);
+        m.i32(3, opt as i32); // REQUIRED 0, OPTIONAL 1
+        m.bin(4, c.name().as_bytes());
+        if let Some(cv) = conv {
+            m.i32(6, cv);
+        }
+        m.end();
+    }
+    m.i64(3, rows as i64);
+    m.list(4, Thrift::STRUCT, chunks.len().min(1));
+    if rows > 0 {
+        m.begin(None);
+        m.list(1, Thrift::STRUCT, cols.len());
+        for (c, &(off, size)) in cols.iter().zip(&chunks) {
+            m.begin(None);
+            m.i64(2, off);
+            m.begin(Some(3));
+            m.i32(1, c.kind().0);
+            m.list(2, Thrift::I32, 2);
+            m.varint(0); // PLAIN (zigzag 0)
+            m.varint(6); // RLE 3 (zigzag 6)
+            m.list(3, Thrift::BIN, 1);
+            m.varint(c.name().len() as u64);
+            m.b.extend_from_slice(c.name().as_bytes());
+            m.i32(4, 0); // UNCOMPRESSED
+            m.i64(5, rows as i64);
+            m.i64(6, size);
+            m.i64(7, size);
+            m.i64(9, off);
+            m.end();
+            m.end();
+        }
+        m.i64(2, chunks.iter().map(|c| c.1).sum());
+        m.i64(3, rows as i64);
+        m.end();
+    }
+    m.b.push(0);
+    f.extend_from_slice(&m.b);
+    f.extend_from_slice(&(m.b.len() as u32).to_le_bytes());
+    f.extend_from_slice(b"PAR1");
+    fs::write(path, &f).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
 #[inline(never)]
 fn write_users(path: &Path, rows: &[UserRow], cats: &[Bytes]) {
-    let schema = Arc::new(
-        parse_message_type(
-            "message m { REQUIRED BYTE_ARRAY user_id (UTF8); REQUIRED INT32 day (DATE); \
-             REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents; \
-             OPTIONAL BYTE_ARRAY top_category (UTF8); }",
-        )
-        .unwrap(),
-    );
-    let mut w = SerializedFileWriter::new(File::create(path).unwrap(), schema, props()).unwrap();
-    for rg in rows.chunks(1 << 20) {
-        let mut g = w.next_row_group().unwrap();
-        let v: Vec<ByteArray> = rg.iter().map(|r| ba_static(unpack(r.name))).collect();
-        let mut c = g.next_column().unwrap().unwrap();
-        c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
-        c.close().unwrap();
-        let v: Vec<i32> = rg.iter().map(|r| r.day).collect();
-        let mut c = g.next_column().unwrap().unwrap();
-        c.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
-        c.close().unwrap();
-        for f in 0..3 {
-            let v: Vec<i64> = rg
-                .iter()
-                .map(|r| match f {
-                    0 => r.sessions as i64,
-                    1 => r.events as i64,
-                    _ => r.rev as i64,
-                })
-                .collect();
-            let mut c = g.next_column().unwrap().unwrap();
-            c.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
-            c.close().unwrap();
-        }
-        let defs: Vec<i16> = rg.iter().map(|r| (r.top != NO_CAT) as i16).collect();
-        let v: Vec<ByteArray> = rg.iter().filter(|r| r.top != NO_CAT).map(|r| ba_static(cats[r.top as usize])).collect();
-        let mut c = g.next_column().unwrap().unwrap();
-        c.typed::<ByteArrayType>().write_batch(&v, Some(&defs), None).unwrap();
-        c.close().unwrap();
-        g.close().unwrap();
-    }
-    w.close().unwrap();
+    let cols = [
+        Col::Str("user_id", rows.iter().map(|r| unpack(r.name)).collect()),
+        Col::Date("day", rows.iter().map(|r| r.day).collect()),
+        Col::I64("sessions", rows.iter().map(|r| r.sessions as i64).collect()),
+        Col::I64("events", rows.iter().map(|r| r.events as i64).collect()),
+        Col::I64("revenue_cents", rows.iter().map(|r| r.rev as i64).collect()),
+        Col::OptStr("top_category", rows.iter().map(|r| (r.top != NO_CAT).then(|| cats[r.top as usize])).collect()),
+    ];
+    write_parquet(path, rows.len(), &cols);
 }
 
 struct CampRow {
@@ -1277,36 +1569,16 @@ struct CampRow {
 }
 
 fn write_campaigns(path: &Path, rows: &[CampRow]) {
-    let schema = Arc::new(
-        parse_message_type(
-            "message m { REQUIRED BYTE_ARRAY campaign_id (UTF8); REQUIRED BYTE_ARRAY channel (UTF8); \
-             REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 purchasing_sessions; \
-             REQUIRED INT64 revenue_cents; REQUIRED INT64 assisted_sessions; }",
-        )
-        .unwrap(),
-    );
-    let mut w = SerializedFileWriter::new(File::create(path).unwrap(), schema, props()).unwrap();
-    for rg in rows.chunks(1 << 20) {
-        let mut g = w.next_row_group().unwrap();
-        for f in 0..2 {
-            let v: Vec<ByteArray> = rg.iter().map(|r| ba(if f == 0 { &r.id } else { &r.channel })).collect();
-            let mut c = g.next_column().unwrap().unwrap();
-            c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
-            c.close().unwrap();
-        }
-        let v: Vec<i32> = rg.iter().map(|r| r.day).collect();
-        let mut c = g.next_column().unwrap().unwrap();
-        c.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
-        c.close().unwrap();
-        for f in 0..4 {
-            let v: Vec<i64> = rg.iter().map(|r| r.vals[f]).collect();
-            let mut c = g.next_column().unwrap().unwrap();
-            c.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
-            c.close().unwrap();
-        }
-        g.close().unwrap();
-    }
-    w.close().unwrap();
+    let cols = [
+        Col::Str("campaign_id", rows.iter().map(|r| &r.id[..]).collect()),
+        Col::Str("channel", rows.iter().map(|r| &r.channel[..]).collect()),
+        Col::Date("day", rows.iter().map(|r| r.day).collect()),
+        Col::I64("sessions", rows.iter().map(|r| r.vals[0]).collect()),
+        Col::I64("purchasing_sessions", rows.iter().map(|r| r.vals[1]).collect()),
+        Col::I64("revenue_cents", rows.iter().map(|r| r.vals[2]).collect()),
+        Col::I64("assisted_sessions", rows.iter().map(|r| r.vals[3]).collect()),
+    ];
+    write_parquet(path, rows.len(), &cols);
 }
 
 // ------------------------------------------------------------------ main
@@ -1389,12 +1661,44 @@ impl Pool {
     }
 }
 
+/// CPUs granted by a cgroup CPU quota (v2 `cpu.max`, or v1 CFS quota), if one is set.
+fn cgroup_cpus() -> Option<usize> {
+    let ceil = |q: f64, p: f64| (q > 0.0 && p > 0.0).then(|| (q / p).ceil().max(1.0) as usize);
+    if let Ok(t) = fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let mut it = t.split_whitespace();
+        let q = it.next()?;
+        let p: f64 = it.next()?.parse().ok()?;
+        return if q == "max" { None } else { ceil(q.parse().ok()?, p) };
+    }
+    for dir in ["/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"] {
+        let read = |f: &str| fs::read_to_string(format!("{dir}/{f}")).ok().and_then(|v| v.trim().parse::<f64>().ok());
+        if let (Some(q), Some(p)) = (read("cpu.cfs_quota_us"), read("cpu.cfs_period_us")) {
+            return ceil(q, p);
+        }
+    }
+    None
+}
+
+/// Worker threads: $NCPU if set, else the usable CPUs (affinity and cgroup quota), at most 8,
+/// the size of the scoring container. More threads than granted CPUs get throttled badly.
+fn worker_count() -> usize {
+    if let Some(n) = std::env::var("NCPU").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0) {
+        return n.min(255);
+    }
+    let mut n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    if let Some(q) = cgroup_cpus() {
+        n = n.min(q);
+    }
+    n.clamp(1, 8)
+}
+
 fn main() {
     let t = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
-    let ncpu: usize = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().unwrap();
+    let workers = worker_count();
+    rayon::ThreadPoolBuilder::new().num_threads(workers).build_global().unwrap();
+    log(&t, &format!("{workers} worker threads"));
 
     let (ws, we) = read_manifest(&data);
 
@@ -1449,7 +1753,10 @@ fn main() {
     }
     log(&t, "reference data");
 
-    let ctx = Ctx { ws, we, products, unknown, campaigns };
+    // all times are kept as u32 ms offsets from the click window start
+    let base = ws - WEEK_MS;
+    assert!(we - base < u32::MAX as i64, "window too long for 32-bit time offsets");
+    let ctx = Ctx { ws, we, base, products, unknown, campaigns };
 
     let linked = build_links(&csv_files(&data.join("links")));
     log(&t, &format!("links: {} linked ids", linked.len()));
@@ -1459,16 +1766,16 @@ fn main() {
     // parse events: each thread writes its own person and event-id shards
     let ev_files = csv_files(&data.join("events"));
     let ev_bytes: u64 = ev_files.iter().map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum();
-    let per_part = (ev_bytes as usize / 64 / pool.0.len() / NPART).max(64);
-    let ev_chunks = chunks(&ev_files);
+    let per_thread = ev_bytes as usize / 64 / pool.0.len();
+    let ev_chunks = chunks(&ev_files, CHUNK);
     ev_chunks.par_iter().for_each(|c| {
         pool.with(|b| {
             let tid = b.tid;
-            let out = b.out.get_or_insert_with(|| ThreadOut::new(per_part));
+            let out = b.out.get_or_insert_with(|| ThreadOut::new(per_thread));
             parse_events(c, &ctx, &linked, out, tid)
         })
     });
-    let outs: Vec<ThreadOut> = pool
+    let mut outs: Vec<ThreadOut> = pool
         .0
         .iter()
         .map(|m| m.lock().unwrap().out.take().unwrap_or_else(|| ThreadOut { evs: (0..NPART).map(|_| vec![]).collect(), keys: (0..NSHARD).map(|_| vec![]).collect() }))
@@ -1490,10 +1797,13 @@ fn main() {
             dedup_shard(g, table, &dead);
         })
     });
+    // the keys are done with: hand their memory back to the allocator for the phases below,
+    // which saves faulting in fresh pages
+    outs.par_iter_mut().for_each(|o| o.keys = Vec::new());
     log(&t, "events deduped");
 
     // parse clicks
-    let ck_chunks = chunks(&csv_files(&data.join("clicks")));
+    let ck_chunks = chunks(&csv_files(&data.join("clicks")), SMALL_CHUNK);
     let click_parts: Vec<PClicks> = ck_chunks.par_iter().map(|c| pool.with(|b| parse_clicks(c, &ctx, &linked, &mut b.clicks))).collect();
     log(&t, "clicks parsed");
 
@@ -1505,6 +1815,7 @@ fn main() {
     // per person shard
     let min_day = ws.div_euclid(DAY_MS);
     let dims = Dims {
+        base: ctx.base,
         min_day,
         ndays: ((we - 1).div_euclid(DAY_MS) - min_day + 1) as usize,
         ncid: camp_names.len(),

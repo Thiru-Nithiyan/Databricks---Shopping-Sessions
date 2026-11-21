@@ -8,5 +8,7 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/pipeline /app/pipeline
 WORKDIR /app
-# DATA_DIR, OUTPUT_DIR and NCPU come from the scorer's environment.
+# Keep freed memory in the allocator: later phases reuse it instead of faulting in fresh pages.
+ENV MIMALLOC_PURGE_DELAY=-1
+# DATA_DIR and OUTPUT_DIR come from the scorer's environment; NCPU optionally caps the threads.
 CMD ["/app/pipeline"]
