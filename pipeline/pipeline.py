@@ -55,55 +55,50 @@ WE = iso_ms(manifest["window_end"])
 
 # ---------------------------------------------------------------- SQL pieces
 
-FIELD = r'("[^",]*"|[^",]*)'
+FIELD_NC = r'(?:"[^",]*"|[^",]*)'
 
 
 def line_pattern(n):
-    return "^" + ",".join([FIELD] * n) + "$"
+    return "^" + ",".join([FIELD_NC] * n) + "$"
 
 
 def raw_lines(glob):
-    # one VARCHAR column holding the whole line; \r stays an ordinary character
+    # one VARCHAR column holding the whole line
     return (f"read_csv('{glob}', columns={{'l': 'VARCHAR'}}, delim='\\x01', quote='', escape='', "
             f"header=true, auto_detect=false, strict_mode=false, null_padding=false)")
 
 
 def parsed(glob, names):
-    """Lines of a CSV as unquoted columns (empty -> NULL). Malformed lines give all NULL."""
+    """Well-formed lines of a CSV as unquoted columns (empty -> NULL).
+
+    A valid line has exactly n fields, each either free of quotes or wrapped whole in
+    one pair; since no value holds a comma, dropping all quotes and splitting on commas
+    then gives the values."""
     n = len(names)
-    keys = ", ".join(f"'{c}'" for c in names)
-    sel = ", ".join(
-        f"NULLIF(CASE WHEN starts_with(g.{c}, '\"') THEN substr(g.{c}, 2, length(g.{c}) - 2) ELSE g.{c} END, '') AS {c}"
-        for c in names
-    )
-    return (f"SELECT {sel} FROM (SELECT regexp_extract(l, '{line_pattern(n)}', [{keys}]) AS g "
-            f"FROM {raw_lines(glob)})")
+    sel = ", ".join(f"NULLIF(f[{i + 1}], '') AS {c}" for i, c in enumerate(names))
+    return (f"SELECT {sel} FROM (SELECT string_split(replace(l, '\"', ''), ',') AS f "
+            f"FROM {raw_lines(glob)} WHERE regexp_full_match(l, '{line_pattern(n)}'))")
 
 
-# timestamp (string -> epoch ms or NULL)
-TS_RE = r"^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:Z|([+-])([0-9]{2}):([0-9]{2}))$"
-TS_KEYS = "['y','mo','d','h','mi','s','sg','oh','om']"
+ISO_RE = "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-][0-9]{2}:[0-9]{2})"
 
-con.execute(f"""
-CREATE MACRO ts_parts(s) AS regexp_extract(s, '{TS_RE}', {TS_KEYS});
-CREATE MACRO ts_ms(s) AS (
-  CASE
-    WHEN s IS NULL THEN NULL
-    WHEN regexp_full_match(s, '[0-9]+') THEN TRY_CAST(s AS BIGINT)
-    ELSE (
-      CASE WHEN ts_parts(s).y = '' THEN NULL
-           WHEN ts_parts(s).h::INT > 23 OR ts_parts(s).mi::INT > 59 OR ts_parts(s).s::INT > 59 THEN NULL
-           WHEN ts_parts(s).oh <> '' AND (ts_parts(s).oh::INT > 23 OR ts_parts(s).om::INT > 59) THEN NULL
-           ELSE (
-             TRY_CAST(ts_parts(s).y || '-' || ts_parts(s).mo || '-' || ts_parts(s).d AS DATE)::DATE - DATE '1970-01-01'
-           )::BIGINT * {DAY_MS}
-             + ts_parts(s).h::BIGINT * 3600000 + ts_parts(s).mi::BIGINT * 60000 + ts_parts(s).s::BIGINT * 1000
-             - CASE WHEN ts_parts(s).oh = '' THEN 0
-                    ELSE (CASE WHEN ts_parts(s).sg = '-' THEN -1 ELSE 1 END)
-                         * (ts_parts(s).oh::BIGINT * 3600000 + ts_parts(s).om::BIGINT * 60000) END
-      END)
-  END)
-""")
+
+def ts_sql(c):
+    """SQL expression: timestamp string column -> epoch ms, NULL when bad."""
+    return f"""(CASE
+  WHEN {c} IS NULL THEN NULL
+  WHEN regexp_full_match({c}, '[0-9]+') THEN TRY_CAST({c} AS BIGINT)
+  WHEN regexp_full_match({c}, '{ISO_RE}') THEN
+    CASE WHEN substr({c}, 12, 2)::INT <= 23 AND substr({c}, 15, 2)::INT <= 59 AND substr({c}, 18, 2)::INT <= 59
+          AND (length({c}) = 20 OR (substr({c}, 21, 2)::INT <= 23 AND substr({c}, 24, 2)::INT <= 59))
+    THEN (TRY_CAST(substr({c}, 1, 10) AS DATE) - DATE '1970-01-01')::BIGINT * {DAY_MS}
+         + substr({c}, 12, 2)::BIGINT * 3600000 + substr({c}, 15, 2)::BIGINT * 60000 + substr({c}, 18, 2)::BIGINT * 1000
+         - CASE WHEN length({c}) = 20 THEN 0
+                ELSE (CASE WHEN substr({c}, 20, 1) = '-' THEN -1 ELSE 1 END)
+                     * (substr({c}, 21, 2)::BIGINT * 3600000 + substr({c}, 24, 2)::BIGINT * 60000) END
+    END
+END)"""
+
 
 # A "\r" is an ordinary character, but DuckDB's CSV reader treats it as a line break.
 # The generator never writes one, so only small inputs (fixtures) get it rewritten to \x02.
@@ -120,6 +115,10 @@ def prep_dir(sub):
     return os.path.join(dst, "*.csv")
 
 
+def day_date(col):
+    return f"(DATE '1970-01-01' + {col}::INTEGER)"
+
+
 # ---------------------------------------------------------------- reference data
 
 log("start")
@@ -129,10 +128,21 @@ SELECT DISTINCT campaign_id, channel FROM ({parsed(os.path.join(DATA, 'campaigns
 WHERE campaign_id IS NOT NULL
 """)
 con.execute(f"""
-CREATE TEMP TABLE products AS
+CREATE TEMP TABLE prod_raw AS
 SELECT DISTINCT product_id, category FROM ({parsed(os.path.join(DATA, 'products.csv'), ['product_id', 'category'])})
 WHERE product_id IS NOT NULL
 """)
+# category codes sort like the category names (byte-wise); 'unknown' is a category like any other
+con.execute("""
+CREATE TEMP TABLE cats AS
+SELECT category, (row_number() OVER (ORDER BY category))::SMALLINT AS code
+FROM (SELECT category FROM prod_raw WHERE category IS NOT NULL UNION SELECT 'unknown')
+""")
+con.execute("""
+CREATE TEMP TABLE products AS
+SELECT p.product_id, c.code FROM prod_raw p JOIN cats c ON c.category = p.category
+""")
+UNKNOWN_CODE = con.execute("SELECT code FROM cats WHERE category = 'unknown'").fetchone()[0]
 
 # ---------------------------------------------------------------- linked IDs
 
@@ -174,144 +184,162 @@ log(f"links done ({n_ids} ids)")
 ev_glob = prep_dir("events")
 EV_COLS = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"]
 con.execute(f"""
-CREATE TEMP TABLE ev_kept AS
-SELECT event_id,
-       arg_min_null(user_id, ingest_ts) AS user_id, arg_min_null(ts, ingest_ts) AS ts, min(ingest_ts) AS ingest_ts,
-       arg_min_null(event_type, ingest_ts) AS event_type, arg_min_null(product_id, ingest_ts) AS product_id,
-       arg_min_null(price_cents, ingest_ts) AS price_cents
-FROM ({parsed(ev_glob, EV_COLS)})
-WHERE event_id IS NOT NULL
-GROUP BY event_id
+CREATE TEMP TABLE ev_raw AS
+SELECT hash(event_id) AS h, * FROM ({parsed(ev_glob, EV_COLS)}) WHERE event_id IS NOT NULL
 """)
+log("events parsed")
+# Most event ids occur once. Find repeated 64-bit hashes cheaply; only those rows
+# (repeats, plus any hash collisions) go through the exact string group-by.
+con.execute("""
+CREATE TEMP TABLE dup_h AS SELECT h FROM ev_raw GROUP BY h HAVING count(*) > 1
+""")
+con.execute("""
+CREATE TEMP TABLE ev_kept AS
+SELECT user_id, ts, ingest_ts, event_type, product_id, price_cents
+FROM ev_raw WHERE h NOT IN (SELECT h FROM dup_h)
+UNION ALL
+SELECT arg_min_null(user_id, ingest_ts), arg_min_null(ts, ingest_ts), min(ingest_ts),
+       arg_min_null(event_type, ingest_ts), arg_min_null(product_id, ingest_ts), arg_min_null(price_cents, ingest_ts)
+FROM ev_raw WHERE h IN (SELECT h FROM dup_h) GROUP BY event_id
+""")
+con.execute("DROP TABLE ev_raw")
 log("events deduped")
 con.execute(f"""
 CREATE TEMP TABLE ev AS
-SELECT coalesce(pm.person, k.user_id) AS person, k.ts_ms AS ts,
-       k.event_type = 'purchase' AS is_purchase,
-       CASE WHEN k.event_type = 'purchase' THEN k.price_cents::BIGINT ELSE 0 END AS price,
-       coalesce(p.category, 'unknown') AS category
+SELECT person, hash(person) AS ph, ts, is_purchase, price, cat
 FROM (
-  SELECT user_id, ts_ms(ts) AS ts_ms, ts_ms(ingest_ts) AS ing, event_type, product_id, price_cents
-  FROM ev_kept
-  WHERE user_id IS NOT NULL AND product_id IS NOT NULL
-    AND event_type IN ('view', 'cart', 'purchase')
-    AND (event_type <> 'purchase'
-         OR (regexp_full_match(price_cents, '[0-9]+') AND TRY_CAST(price_cents AS BIGINT) BETWEEN 1 AND 10000000))
-) k
-LEFT JOIN pmap pm ON pm.id = k.user_id
-LEFT JOIN products p ON p.product_id = k.product_id
-WHERE k.ts_ms >= {WS} AND k.ts_ms < {WE} AND k.ing - k.ts_ms <= {DAY_MS}
+  SELECT coalesce(pm.person, k.user_id) AS person, k.ts, k.event_type = 'purchase' AS is_purchase,
+         CASE WHEN k.event_type = 'purchase' THEN k.price_cents::BIGINT ELSE 0 END AS price,
+         coalesce(p.code, {UNKNOWN_CODE}::SMALLINT) AS cat
+  FROM (
+    SELECT user_id, {ts_sql('ts')} AS ts, {ts_sql('ingest_ts')} AS ing, event_type, product_id, price_cents
+    FROM ev_kept
+    WHERE user_id IS NOT NULL AND product_id IS NOT NULL
+      AND event_type IN ('view', 'cart', 'purchase')
+      AND (event_type <> 'purchase'
+           OR (regexp_full_match(price_cents, '[0-9]+') AND TRY_CAST(price_cents AS BIGINT) BETWEEN 1 AND 10000000))
+  ) k
+  LEFT JOIN pmap pm ON pm.id = k.user_id
+  LEFT JOIN products p ON p.product_id = k.product_id
+  WHERE k.ts >= {WS} AND k.ts < {WE} AND k.ing - k.ts <= {DAY_MS}
+)
 """)
 con.execute("DROP TABLE ev_kept")
+con.execute("CREATE TEMP TABLE names AS SELECT ph, any_value(person) AS person FROM ev GROUP BY ph")
 log("events cleaned")
 
 # ---------------------------------------------------------------- sessions
 
 con.execute(f"""
 CREATE TEMP TABLE ev_s AS
-SELECT person, ts, is_purchase, price, category,
-       max(CASE WHEN nw THEN ts END) OVER (PARTITION BY person ORDER BY ts) AS start
+SELECT ph, is_purchase, price, cat,
+       (max(CASE WHEN nw THEN ts END) OVER (PARTITION BY ph ORDER BY ts)) AS start
 FROM (
-  SELECT *, (lag(ts) OVER (PARTITION BY person ORDER BY ts) IS NULL
-             OR ts - lag(ts) OVER (PARTITION BY person ORDER BY ts) > {SESSION_GAP_MS}) AS nw
+  SELECT ph, ts, is_purchase, price, cat,
+         (lag(ts) OVER (PARTITION BY ph ORDER BY ts) IS NULL
+          OR ts - lag(ts) OVER (PARTITION BY ph ORDER BY ts) > {SESSION_GAP_MS}) AS nw
   FROM ev
 )
 """)
 con.execute("DROP TABLE ev")
 con.execute(f"""
 CREATE TEMP TABLE sess AS
-SELECT person, start, (DATE '1970-01-01' + (start // {DAY_MS})::INTEGER) AS day,
+SELECT ph, start, start // {DAY_MS} AS day,
        count(*) AS events, sum(price) AS revenue, count_if(is_purchase) AS purchases
-FROM ev_s GROUP BY person, start
+FROM ev_s GROUP BY ph, start
 """)
 log("sessions built")
 
-# user_daily
-con.execute("""
+con.execute(f"""
 CREATE TEMP TABLE user_cat AS
-SELECT person, day, arg_min(category, (-s, category)) AS top_category FROM (
-  SELECT person, (DATE '1970-01-01' + (start // 86400000)::INTEGER) AS day, category, sum(price) AS s
+SELECT ph, day, arg_min(cat, (-s, cat)) AS top_cat FROM (
+  SELECT ph, start // {DAY_MS} AS day, cat, sum(price) AS s
   FROM ev_s WHERE is_purchase GROUP BY ALL
-) GROUP BY person, day
+) GROUP BY ph, day
 """)
 con.execute("DROP TABLE ev_s")
 os.makedirs(os.path.join(OUT, "user_daily"), exist_ok=True)
 os.makedirs(os.path.join(OUT, "campaign_daily"), exist_ok=True)
 con.execute(f"""
 COPY (
-  SELECT s.person AS user_id, s.day, count(*)::BIGINT AS sessions, sum(s.events)::BIGINT AS events,
-         sum(s.revenue)::BIGINT AS revenue_cents, any_value(c.top_category) AS top_category
-  FROM sess s LEFT JOIN user_cat c ON c.person = s.person AND c.day = s.day
-  GROUP BY s.person, s.day
+  SELECT n.person AS user_id, {day_date('s.day')} AS day, s.sessions, s.events, s.revenue_cents,
+         cc.category AS top_category
+  FROM (
+    SELECT ph, day, count(*)::BIGINT AS sessions, sum(events)::BIGINT AS events, sum(revenue)::BIGINT AS revenue_cents
+    FROM sess GROUP BY ph, day
+  ) s
+  JOIN names n ON n.ph = s.ph
+  LEFT JOIN user_cat c ON c.ph = s.ph AND c.day = s.day
+  LEFT JOIN cats cc ON cc.code = c.top_cat
 ) TO '{os.path.join(OUT, 'user_daily', 'part-0.parquet')}' (FORMAT parquet)
 """)
 log("user_daily written")
 
 # ---------------------------------------------------------------- clicks
+# Duplicate clicks are identical, so they change nothing below and are not removed.
 
 ck_glob = prep_dir("clicks")
 CK_COLS = ["click_id", "user_id", "campaign_id", "ts"]
 con.execute(f"""
 CREATE TEMP TABLE clk AS
-SELECT coalesce(pm.person, k.user_id) AS person, k.ts, k.campaign_id, k.click_id
+SELECT hash(coalesce(pm.person, k.user_id)) AS ph, k.ts, k.campaign_id, k.click_id
 FROM (
-  SELECT click_id, any_value(user_id) AS user_id, any_value(campaign_id) AS campaign_id, any_value(ts_ms(ts)) AS ts
-  FROM ({parsed(ck_glob, CK_COLS)}) WHERE click_id IS NOT NULL GROUP BY click_id
+  SELECT click_id, user_id, campaign_id, {ts_sql('ts')} AS ts
+  FROM ({parsed(ck_glob, CK_COLS)})
+  WHERE click_id IS NOT NULL AND user_id IS NOT NULL
 ) k
 JOIN campaigns c ON c.campaign_id = k.campaign_id
 LEFT JOIN pmap pm ON pm.id = k.user_id
-WHERE k.user_id IS NOT NULL AND k.ts >= {WS - WEEK_MS} AND k.ts < {WE}
+WHERE k.ts >= {WS - WEEK_MS} AND k.ts < {WE}
 """)
 con.execute("""
 CREATE TEMP TABLE clk_pt AS
-SELECT person, ts, arg_min(campaign_id, click_id) AS campaign_id FROM clk GROUP BY person, ts
+SELECT ph, ts, arg_min(campaign_id, click_id) AS campaign_id FROM clk GROUP BY ph, ts
 """)
 log("clicks cleaned")
 
-# credit
 con.execute(f"""
 CREATE TEMP TABLE credited AS
 SELECT s.day, s.purchases > 0 AS purchasing, s.revenue,
        CASE WHEN c.ts IS NOT NULL AND s.start - c.ts <= {WEEK_MS} THEN c.campaign_id ELSE 'organic' END AS campaign_id
-FROM sess s ASOF LEFT JOIN clk_pt c ON s.person = c.person AND s.start >= c.ts
+FROM sess s ASOF LEFT JOIN clk_pt c ON s.ph = c.ph AND s.start >= c.ts
 """)
 log("credit done")
 
-# assists
-con.execute(f"""
+# assists: per (person, campaign) the clicks' 7-day windows merge into islands; count the
+# person's sessions inside each island per day using session ranks.
+con.execute("""
 CREATE TEMP TABLE sess_rank AS
-SELECT person, start, day, (row_number() OVER (PARTITION BY person ORDER BY start))::BIGINT AS rk FROM sess
+SELECT ph, start, day, (row_number() OVER (PARTITION BY ph ORDER BY start))::BIGINT AS rk FROM sess
 """)
 con.execute("""
 CREATE TEMP TABLE sess_day AS
-SELECT person, day, min(rk) AS rlo, max(rk) AS rhi FROM sess_rank GROUP BY person, day
+SELECT ph, day, min(rk) AS rlo, max(rk) AS rhi FROM sess_rank GROUP BY ph, day
 """)
 con.execute(f"""
 CREATE TEMP TABLE islands AS
-SELECT person, campaign_id, min(ts) AS a, max(ts) + {WEEK_MS} AS b FROM (
-  SELECT *, sum(CASE WHEN gap > {WEEK_MS} THEN 1 ELSE 0 END) OVER (PARTITION BY person, campaign_id ORDER BY ts) AS isl
+SELECT ph, campaign_id, min(ts) AS a, max(ts) + {WEEK_MS} AS b FROM (
+  SELECT *, sum(CASE WHEN gap > {WEEK_MS} THEN 1 ELSE 0 END) OVER (PARTITION BY ph, campaign_id ORDER BY ts) AS isl
   FROM (
-    SELECT c.person, c.campaign_id, c.ts,
-           c.ts - lag(c.ts) OVER (PARTITION BY c.person, c.campaign_id ORDER BY c.ts) AS gap
-    FROM (SELECT DISTINCT person, campaign_id, ts FROM clk
-          WHERE person IN (SELECT person FROM sess_day)) c
+    SELECT c.ph, c.campaign_id, c.ts,
+           c.ts - lag(c.ts) OVER (PARTITION BY c.ph, c.campaign_id ORDER BY c.ts) AS gap
+    FROM (SELECT DISTINCT ph, campaign_id, ts FROM clk
+          WHERE ph IN (SELECT ph FROM sess_day)) c
   )
-) GROUP BY person, campaign_id, isl
+) GROUP BY ph, campaign_id, isl
 """)
 con.execute("""
 CREATE TEMP TABLE island_rk AS
-SELECT i.person, i.campaign_id,
-       coalesce(l.rk, 0) AS lo, coalesce(h.rk, 0) AS hi
+SELECT i.ph, i.campaign_id, coalesce(l.rk, 0) AS lo, coalesce(h.rk, 0) AS hi
 FROM islands i
-ASOF LEFT JOIN sess_rank l ON i.person = l.person AND (i.a - 1) >= l.start
-ASOF LEFT JOIN sess_rank h ON i.person = h.person AND i.b >= h.start
+ASOF LEFT JOIN sess_rank l ON i.ph = l.ph AND (i.a - 1) >= l.start
+ASOF LEFT JOIN sess_rank h ON i.ph = h.ph AND i.b >= h.start
 """)
 con.execute("""
 CREATE TEMP TABLE assisted AS
 SELECT campaign_id, day, sum(n)::BIGINT AS assisted_sessions FROM (
-  SELECT r.campaign_id, d.day,
-         least(r.hi, d.rhi) - greatest(r.lo, d.rlo - 1) AS n
-  FROM island_rk r JOIN sess_day d ON d.person = r.person
+  SELECT r.campaign_id, d.day, least(r.hi, d.rhi) - greatest(r.lo, d.rlo - 1) AS n
+  FROM island_rk r JOIN sess_day d ON d.ph = r.ph
 )
 WHERE n > 0 GROUP BY campaign_id, day
 """)
@@ -319,7 +347,7 @@ log("assists done")
 
 con.execute(f"""
 COPY (
-  SELECT x.campaign_id, coalesce(c.channel, 'organic') AS channel, x.day,
+  SELECT x.campaign_id, coalesce(c.channel, 'organic') AS channel, {day_date('x.day')} AS day,
          coalesce(cr.sessions, 0)::BIGINT AS sessions,
          coalesce(cr.purchasing_sessions, 0)::BIGINT AS purchasing_sessions,
          coalesce(cr.revenue_cents, 0)::BIGINT AS revenue_cents,
