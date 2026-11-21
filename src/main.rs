@@ -7,8 +7,8 @@
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -648,10 +648,15 @@ fn parse_clicks(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, flat: &mut Vec<Clic
         if ts < ctx.ws - WEEK_MS || ts >= ctx.we {
             return;
         }
-        let uh = xxh3_64(f[1]);
-        let (key, _) = person(linked, uh, 0);
-        flat.push(Click { person: key, ts, cid, id: f[0] });
+        flat.push(Click { person: xxh3_64(f[1]), ts, cid, id: f[0] }); // user id hash for now
     });
+    let n = flat.len();
+    for i in 0..n {
+        if i + 16 < n {
+            linked.prefetch(flat[i + 16].person);
+        }
+        flat[i].person = person(linked, flat[i].person, 0).0;
+    }
     let mut off = [0u32; NPART + 1];
     for c in flat.iter() {
         off[(c.person % NPART as u64) as usize + 1] += 1;
@@ -673,9 +678,59 @@ fn parse_clicks(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, flat: &mut Vec<Clic
 
 // ------------------------------------------------------------------ links
 
+/// A raw pointer that parallel workers write through at disjoint indices.
+struct SyncPtr<T>(*mut T);
+unsafe impl<T> Sync for SyncPtr<T> {}
+unsafe impl<T> Send for SyncPtr<T> {}
+impl<T> SyncPtr<T> {
+    /// SAFETY: callers write each index from one worker only, inside the buffer.
+    #[inline]
+    unsafe fn write(&self, i: usize, v: T) {
+        self.0.add(i).write(v);
+    }
+}
+
+fn atomics(v: &mut [u64]) -> &[AtomicU64] {
+    // SAFETY: AtomicU64 has the size and alignment of u64 on the supported targets.
+    unsafe { &*(v as *mut [u64] as *const [AtomicU64]) }
+}
+
+/// Root of `x` in a union-find forest shared between threads (path halving by CAS).
+#[inline]
+fn uf_find(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = parent[x as usize].load(Acquire);
+        if p == x {
+            return x;
+        }
+        let g = parent[p as usize].load(Acquire);
+        if g != p {
+            let _ = parent[x as usize].compare_exchange_weak(p, g, AcqRel, Relaxed);
+        }
+        x = p;
+    }
+}
+
+/// Join the sets of `a` and `b`; the larger root index is hung under the smaller.
+fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
+    let (mut a, mut b) = (a, b);
+    loop {
+        a = uf_find(parent, a);
+        b = uf_find(parent, b);
+        if a == b {
+            return;
+        }
+        if a < b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        if parent[a as usize].compare_exchange(a, b, AcqRel, Relaxed).is_ok() {
+            return;
+        }
+    }
+}
+
 fn build_links(files: &[PathBuf]) -> LinkTable {
     let ch = chunks(files);
-    // (hash, name) for both ends of every link, hashed in parallel
     let pairs: Vec<Vec<[(u64, Bytes); 2]>> = ch
         .par_iter()
         .map(|c| {
@@ -688,59 +743,100 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
             v
         })
         .collect();
-    // dense ids: sort the distinct endpoints by hash
-    let mut ends: Vec<(u64, Bytes)> = Vec::with_capacity(pairs.iter().map(|v| v.len() * 2).sum());
-    for v in &pairs {
-        for e in v {
-            ends.push(e[0]);
-            ends.push(e[1]);
-        }
+    let ep: Vec<[(u64, Bytes); 2]> = pairs.concat();
+    std::mem::forget(pairs);
+    let name_of = |slot: u32| ep[slot as usize / 2][slot as usize % 2].1;
+
+    // dense ids: sort the (hash, endpoint) pairs; each distinct hash is one id
+    let mut keys: Vec<(u64, u32)> = ep
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(i, e)| [(e[0].0, 2 * i as u32), (e[1].0, 2 * i as u32 + 1)])
+        .collect();
+    keys.par_sort_unstable_by_key(|k| k.0);
+    let m = keys.len();
+    const NB: usize = 256;
+    let bs = m.div_ceil(NB).max(1);
+    let is_new = |j: usize| j == 0 || keys[j].0 != keys[j - 1].0;
+    let mut base: Vec<u32> = (0..NB)
+        .into_par_iter()
+        .map(|b| (b * bs..((b + 1) * bs).min(m)).filter(|&j| is_new(j)).count() as u32)
+        .collect();
+    let mut acc = 0;
+    for x in base.iter_mut() {
+        let c = *x;
+        *x = acc;
+        acc += c;
     }
-    ends.par_sort_unstable_by_key(|e| e.0);
-    ends.dedup_by_key(|e| e.0);
-    let hashes: Vec<u64> = ends.iter().map(|e| e.0).collect();
-    let names: Vec<Bytes> = ends.iter().map(|e| e.1).collect();
-    drop(ends);
-    let idx = |h: u64| hashes.binary_search(&h).unwrap() as u32;
-    let edges: Vec<Vec<(u32, u32)>> =
-        pairs.par_iter().map(|v| v.iter().map(|e| (idx(e[0].0), idx(e[1].0))).collect()).collect();
-
-    let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-    let mut min_name: Vec<Bytes> = names.clone();
-
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let p = parent[x as usize];
-            parent[x as usize] = parent[p as usize];
-            x = parent[x as usize];
-        }
-        x
-    }
-
-    for v in &edges {
-        for &(a, b) in v {
-            let ra = find(&mut parent, a);
-            let rb = find(&mut parent, b);
-            if ra != rb {
-                parent[rb as usize] = ra;
-                if min_name[rb as usize] < min_name[ra as usize] {
-                    min_name[ra as usize] = min_name[rb as usize];
+    let n = acc as usize;
+    let mut hashes: Vec<u64> = vec![0; n];
+    let mut names: Vec<Bytes> = vec![&[]; n];
+    let mut end_id: Vec<u32> = vec![0; m];
+    {
+        let (hp, np, ep_) = (SyncPtr(hashes.as_mut_ptr()), SyncPtr(names.as_mut_ptr()), SyncPtr(end_id.as_mut_ptr()));
+        (0..NB).into_par_iter().for_each(|b| {
+            let mut id = base[b] as i64 - 1;
+            for j in b * bs..((b + 1) * bs).min(m) {
+                let (h, slot) = keys[j];
+                if is_new(j) {
+                    id += 1;
+                    // SAFETY: each id and each endpoint slot is written by exactly one block.
+                    unsafe {
+                        hp.write(id as usize, h);
+                        np.write(id as usize, name_of(slot));
+                    }
                 }
+                unsafe { ep_.write(slot as usize, id as u32) };
+            }
+        });
+    }
+    std::mem::forget(keys);
+
+    // connected components, then the byte-wise smallest name of each
+    let parent: Vec<AtomicU32> = (0..n as u32).into_par_iter().map(AtomicU32::new).collect();
+    end_id.par_chunks_exact(2).for_each(|e| uf_union(&parent, e[0], e[1]));
+    let root: Vec<u32> = (0..n as u32).into_par_iter().map(|i| uf_find(&parent, i)).collect();
+    let best: Vec<AtomicU32> = (0..n).into_par_iter().map(|_| AtomicU32::new(u32::MAX)).collect();
+    (0..n).into_par_iter().for_each(|i| {
+        let r = &best[root[i] as usize];
+        let mut cur = r.load(Relaxed);
+        while cur == u32::MAX || names[i] < names[cur as usize] {
+            match r.compare_exchange_weak(cur, i as u32, Relaxed, Relaxed) {
+                Ok(_) => break,
+                Err(c) => cur = c,
             }
         }
+    });
+
+    // the table, filled in parallel
+    let mut linked = LinkTable::with_capacity(n);
+    {
+        let mask = linked.mask;
+        let keys_a = atomics(&mut linked.keys);
+        let filter_a = atomics(&mut linked.filter);
+        let vals = SyncPtr(linked.vals.as_mut_ptr());
+        (0..n).into_par_iter().for_each(|i| {
+            let h = hashes[i];
+            if h == 0 {
+                return;
+            }
+            let (w, bit) = LinkTable::filter_bit(h);
+            filter_a[w].fetch_or(bit, Relaxed);
+            let nm = names[best[root[i] as usize].load(Relaxed) as usize];
+            let mut j = h as usize & mask;
+            loop {
+                match keys_a[j].compare_exchange(0, h, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        // SAFETY: the slot was claimed by this worker alone.
+                        unsafe { vals.write(j, (xxh3_64(nm), pack(nm))) };
+                        break;
+                    }
+                    Err(_) => j = (j + 1) & mask,
+                }
+            }
+        });
     }
-    let mut linked = LinkTable::with_capacity(names.len());
-    // person key per root, computed once
-    let mut root_key: Vec<u64> = vec![0; names.len()];
-    for i in 0..names.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        if root_key[r] == 0 {
-            root_key[r] = xxh3_64(min_name[r]);
-        }
-        linked.insert(hashes[i], (root_key[r], pack(min_name[r])));
-    }
-    std::mem::forget(pairs);
-    std::mem::forget(edges);
+    std::mem::forget(ep);
     linked
 }
 
@@ -1239,6 +1335,11 @@ fn main() {
     let click_parts: Vec<PClicks> = ck_chunks.par_iter().map_init(Vec::new, |flat, c| parse_clicks(c, &ctx, &linked, flat)).collect();
     log(&t, "clicks parsed");
 
+    let ud = out.join("user_daily");
+    let cd = out.join("campaign_daily");
+    fs::create_dir_all(&ud).unwrap();
+    fs::create_dir_all(&cd).unwrap();
+
     // per person shard
     let min_day = ws.div_euclid(DAY_MS);
     let dims = Dims {
@@ -1289,7 +1390,11 @@ fn main() {
                     cks[w[0] as usize..w[1] as usize]
                         .sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.cmp(b.id)));
                 }
-                process_part(evs, cks, &dims)
+                let o = process_part(evs, cks, &dims);
+                if !o.users.is_empty() || p == 0 {
+                    write_users(&ud.join(format!("part-{p}.parquet")), &o.users, &cat_names);
+                }
+                o
             },
         )
         .collect();
@@ -1297,16 +1402,7 @@ fn main() {
     std::mem::forget(click_parts);
     log(&t, "sessions, credit and assists done");
 
-    // outputs
-    let ud = out.join("user_daily");
-    let cd = out.join("campaign_daily");
-    fs::create_dir_all(&ud).unwrap();
-    fs::create_dir_all(&cd).unwrap();
-    parts.par_iter().enumerate().for_each(|(p, o)| {
-        if !o.users.is_empty() || p == 0 {
-            write_users(&ud.join(format!("part-{p}.parquet")), &o.users, &cat_names);
-        }
-    });
+    // campaign output (user parts were written per shard)
     let mut rows: Vec<CampRow> = vec![];
     let nd = dims.ndays;
     for cid in 0..dims.ncid {
