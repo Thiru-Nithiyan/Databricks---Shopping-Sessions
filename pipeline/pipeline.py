@@ -203,30 +203,31 @@ log(f"links done ({n_ids} ids)")
 
 ev_glob = prep_dir("events")
 EV_COLS = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"]
-# Most event ids occur once. Find repeated 64-bit hashes of the id's first field in a cheap
-# pass (malformed lines may join in; that only sends extra rows down the exact path below).
+# One parse of the files. Timestamps become integers right away (a bad one becomes NULL), so
+# the table holds short inline strings and integers only. Validation waits until after dedup.
 con.execute(f"""
-CREATE TEMP TABLE dup_h AS
-SELECT h FROM (SELECT hash(replace(split_part(l, ',', 1), '"', '')) AS h FROM {raw_lines(ev_glob)})
-WHERE h IS NOT NULL GROUP BY h HAVING count(*) > 1
+CREATE TEMP TABLE ev_raw AS
+SELECT hash(event_id) AS h, event_id, user_id, {ts_sql('ts')} AS ts, {ts_sql('ingest_ts')} AS ing,
+       event_type, product_id, price_cents
+FROM ({parsed(ev_glob, EV_COLS)}) WHERE event_id IS NOT NULL
 """)
-log("duplicate hashes found")
+log("events parsed")
+# Most event ids occur once: find repeated hashes cheaply; only those rows (plus any
+# hash collisions) go through the exact group-by on event_id.
+con.execute("CREATE TEMP TABLE dup_h AS SELECT h FROM ev_raw GROUP BY h HAVING count(*) > 1")
 con.execute(f"""
 CREATE TEMP TABLE ev AS
-WITH p AS NOT MATERIALIZED (
-  SELECT hash(event_id) AS h, * FROM ({parsed(ev_glob, EV_COLS)}) WHERE event_id IS NOT NULL
-),
-kept AS NOT MATERIALIZED (
-  SELECT user_id, ts, ingest_ts, event_type, product_id, price_cents FROM p ANTI JOIN dup_h USING (h)
+WITH kept AS (
+  SELECT user_id, ts, ing, event_type, product_id, price_cents FROM ev_raw ANTI JOIN dup_h USING (h)
   UNION ALL
-  SELECT arg_min_null(user_id, ingest_ts), arg_min_null(ts, ingest_ts), min(ingest_ts),
-         arg_min_null(event_type, ingest_ts), arg_min_null(product_id, ingest_ts), arg_min_null(price_cents, ingest_ts)
-  FROM p SEMI JOIN dup_h USING (h) GROUP BY event_id
+  SELECT arg_min_null(user_id, ing), arg_min_null(ts, ing), min(ing),
+         arg_min_null(event_type, ing), arg_min_null(product_id, ing), arg_min_null(price_cents, ing)
+  FROM ev_raw SEMI JOIN dup_h USING (h) GROUP BY event_id
 ),
-k AS NOT MATERIALIZED (
-  SELECT user_id, {ts_sql('ts')} AS ts, {ts_sql('ingest_ts')} AS ing, event_type, product_id, price_cents
-  FROM kept
+k AS (
+  SELECT * FROM kept
   WHERE user_id IS NOT NULL AND product_id IS NOT NULL
+    AND ts >= {WS} AND ts < {WE} AND ing - ts <= {DAY_MS}
     AND event_type IN ('view', 'cart', 'purchase')
     AND (event_type <> 'purchase'
          OR (regexp_full_match(price_cents, '[0-9]+') AND TRY_CAST(price_cents AS BIGINT) BETWEEN 1 AND 10000000))
@@ -237,8 +238,8 @@ SELECT k.user_id AS uid, coalesce(pm.ph, hash(k.user_id)) AS ph, k.ts, k.event_t
 FROM k
 LEFT JOIN pmap pm ON pm.idh = hash(k.user_id)
 LEFT JOIN products p ON p.product_id = k.product_id
-WHERE k.ts >= {WS} AND k.ts < {WE} AND k.ing - k.ts <= {DAY_MS}
 """)
+con.execute("DROP TABLE ev_raw")
 con.execute("CREATE TEMP TABLE names AS SELECT ph, any_value(uid) AS uid FROM ev GROUP BY ph")
 log("events cleaned")
 
