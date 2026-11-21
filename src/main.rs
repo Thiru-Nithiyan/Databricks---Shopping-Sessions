@@ -459,7 +459,69 @@ struct StrTable<V> {
     cats: Vec<V>,
 }
 
-type ProdTable = StrTable<u8>;
+/// Product id -> category code. Ids of the form <prefix letter><number without leading zeros>
+/// (`p1`, `p50000`) index a dense array that stays in cache; any other id uses the hash table.
+/// A canonical lookup id can only equal a canonical product id, so the array alone answers it.
+struct ProdTable {
+    prefix: u8,
+    dense: Vec<u8>, // DENSE_NONE: not in the array
+    table: StrTable<u8>,
+    canonical_in_table: bool,
+}
+
+const DENSE_NONE: u8 = 255;
+const DENSE_CAP: usize = 1 << 22;
+
+impl ProdTable {
+    fn new(n: usize, prefix: u8) -> ProdTable {
+        ProdTable { prefix, dense: vec![], table: StrTable::new(n), canonical_in_table: false }
+    }
+
+    /// The number of a canonical id, if `id` is one.
+    #[inline]
+    fn number(&self, id: &[u8]) -> Option<usize> {
+        if id.len() < 2 || id.len() > 8 || id[0] != self.prefix || id[1] == b'0' {
+            return None;
+        }
+        let mut v = 0usize;
+        for &b in &id[1..] {
+            let d = b.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as usize;
+        }
+        Some(v)
+    }
+
+    /// Insert or overwrite (a later row for the same product wins).
+    fn insert(&mut self, id: &[u8], cat: u8) {
+        match self.number(id) {
+            Some(v) if v < DENSE_CAP && cat != DENSE_NONE => {
+                if v >= self.dense.len() {
+                    self.dense.resize(v + 1, DENSE_NONE);
+                }
+                self.dense[v] = cat;
+            }
+            Some(_) => {
+                self.canonical_in_table = true;
+                self.table.insert(id, cat);
+            }
+            None => self.table.insert(id, cat),
+        }
+    }
+
+    #[inline]
+    fn get(&self, id: &[u8]) -> Option<u8> {
+        if let Some(v) = self.number(id) {
+            let c = self.dense.get(v).copied().unwrap_or(DENSE_NONE);
+            if c != DENSE_NONE || !self.canonical_in_table {
+                return (c != DENSE_NONE).then_some(c);
+            }
+        }
+        self.table.get(id)
+    }
+}
 
 impl<V: Copy + Default> StrTable<V> {
     fn new(n: usize) -> StrTable<V> {
@@ -509,14 +571,14 @@ struct Ctx {
     campaigns: StrTable<u32>,
 }
 
-/// Linked id hash -> (person key, person name). Open addressing over power-of-two arrays so a
-/// lookup can be prefetched; hash 0 marks an empty slot and is never stored. A cache-sized bit
-/// filter answers most lookups of unlinked ids without touching the table.
+/// Linked id hash -> (person key, person name). Open addressing over a power-of-two array of
+/// 3-word slots (hash, person key, packed name), so one lookup touches one cache line and can be
+/// prefetched; hash 0 marks an empty slot and is never stored. A cache-sized bit filter answers
+/// most lookups of unlinked ids without touching the table.
 struct LinkTable {
     mask: usize,
     shift: u32,
-    keys: Vec<u64>,
-    vals: Vec<(u64, u64)>,
+    slots: Vec<u64>,
     filter: Vec<u64>,
 }
 
@@ -528,8 +590,7 @@ impl LinkTable {
         LinkTable {
             mask: cap - 1,
             shift: 64 - cap.trailing_zeros(),
-            keys: vec![0; cap],
-            vals: vec![(0, 0); cap],
+            slots: vec![0; 3 * cap],
             filter: vec![0; 1 << (FILTER_BITS - 6)],
         }
     }
@@ -553,21 +614,7 @@ impl LinkTable {
     }
 
     fn len(&self) -> usize {
-        self.keys.iter().filter(|&&k| k != 0).count()
-    }
-
-    fn insert(&mut self, h: u64, v: (u64, u64)) {
-        if h == 0 {
-            return;
-        }
-        let (w, m) = Self::filter_bit(h);
-        self.filter[w] |= m;
-        let mut i = self.slot(h);
-        while self.keys[i] != 0 && self.keys[i] != h {
-            i = (i + 1) & self.mask;
-        }
-        self.keys[i] = h;
-        self.vals[i] = v;
+        self.slots.iter().step_by(3).filter(|&&k| k != 0).count()
     }
 
     #[inline]
@@ -577,9 +624,10 @@ impl LinkTable {
         }
         let mut i = self.slot(h);
         loop {
-            let k = unsafe { *self.keys.get_unchecked(i) };
+            // SAFETY: i <= mask, and slots holds 3 * (mask + 1) words.
+            let k = unsafe { *self.slots.get_unchecked(3 * i) };
             if k == h {
-                return Some(unsafe { *self.vals.get_unchecked(i) });
+                return Some(unsafe { (*self.slots.get_unchecked(3 * i + 1), *self.slots.get_unchecked(3 * i + 2)) });
             }
             if k == 0 {
                 return None;
@@ -606,9 +654,9 @@ impl LinkTable {
         if self.maybe(h) {
             unsafe {
                 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                let i = self.slot(h);
-                _mm_prefetch(self.keys.as_ptr().add(i) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(self.vals.as_ptr().add(i) as *const i8, _MM_HINT_T0);
+                let p = self.slots.as_ptr().add(3 * self.slot(h));
+                _mm_prefetch(p as *const i8, _MM_HINT_T0);
+                _mm_prefetch(p.add(2) as *const i8, _MM_HINT_T0); // a slot may cross a line
             }
         }
     }
@@ -1012,9 +1060,9 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
     let mut linked = LinkTable::with_capacity(n);
     {
         let (mask, shift) = (linked.mask, linked.shift);
-        let keys_a = atomics(&mut linked.keys);
         let filter_a = atomics(&mut linked.filter);
-        let vals = SyncPtr(linked.vals.as_mut_ptr());
+        let vals = SyncPtr(linked.slots.as_mut_ptr());
+        let keys_a = atomics(&mut linked.slots);
         (0..n).into_par_iter().for_each(|i| {
             let h = hashes[i];
             if h == 0 {
@@ -1025,10 +1073,13 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
             let nm = names[best[root[i] as usize].load(Relaxed) as usize];
             let mut j = (h >> shift) as usize;
             loop {
-                match keys_a[j].compare_exchange(0, h, Relaxed, Relaxed) {
+                match keys_a[3 * j].compare_exchange(0, h, Relaxed, Relaxed) {
                     Ok(_) => {
                         // SAFETY: the slot was claimed by this worker alone.
-                        unsafe { vals.write(j, (xxh3_64(unpack(nm)), nm)) };
+                        unsafe {
+                            vals.write(3 * j + 1, xxh3_64(unpack(nm)));
+                            vals.write(3 * j + 2, nm);
+                        }
                         break;
                     }
                     Err(_) => j = (j + 1) & mask,
@@ -1745,7 +1796,7 @@ fn main() {
     cat_names.push(b"unknown");
     cat_names.sort_unstable();
     cat_names.dedup();
-    let mut products = ProdTable::new(prod_rows.len());
+    let mut products = ProdTable::new(prod_rows.len(), prod_rows.first().and_then(|r| r[0].first().copied()).unwrap_or(b'p'));
     for r in &prod_rows {
         if let Ok(c) = cat_names.binary_search(&r[1]) {
             products.insert(r[0], c as u8);
