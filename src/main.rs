@@ -8,7 +8,7 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -44,6 +44,34 @@ fn load(path: &Path) -> Bytes {
     let m = unsafe { Mmap::map(&f) }.unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let m: &'static Mmap = Box::leak(Box::new(m));
     &m[..]
+}
+
+/// Ask the kernel to start reading `files` into the page cache now, so disk reads run ahead of
+/// the parsers (input may be cold on disk; mapped pages would otherwise fault in one small read
+/// at a time).
+fn read_ahead(files: &[PathBuf]) {
+    #[cfg(target_os = "linux")]
+    for p in files {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(f) = File::open(p) {
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED) };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = files;
+}
+
+/// Run `f` on every item on all worker threads, handing items out strictly in order, so the
+/// parsers follow the read-ahead through the files.
+fn for_each_in_order<T: Sync>(items: &[T], f: impl Fn(&T) + Sync) {
+    let next = AtomicUsize::new(0);
+    rayon::broadcast(|_| loop {
+        let i = next.fetch_add(1, Relaxed);
+        if i >= items.len() {
+            break;
+        }
+        f(&items[i]);
+    });
 }
 
 fn csv_files(dir: &Path) -> Vec<PathBuf> {
@@ -1770,6 +1798,13 @@ fn main() {
     log(&t, &format!("{workers} worker threads"));
 
     let (ws, we) = read_manifest(&data);
+    {
+        // start disk reads for all inputs, in the order they are used
+        let mut files = csv_files(&data.join("links"));
+        files.extend(csv_files(&data.join("events")));
+        files.extend(csv_files(&data.join("clicks")));
+        std::thread::spawn(move || read_ahead(&files));
+    }
 
     // reference data
     let mut cat_names: Vec<Bytes> = vec![];
@@ -1841,7 +1876,7 @@ fn main() {
     let ev_bytes: u64 = ev_files.iter().map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum();
     let per_thread = ev_bytes as usize / 64 / pool.0.len();
     let ev_chunks = chunks(&ev_files, CHUNK);
-    ev_chunks.par_iter().for_each(|c| {
+    for_each_in_order(&ev_chunks, |c| {
         pool.with(|b| {
             let tid = b.tid;
             let out = b.out.get_or_insert_with(|| ThreadOut::new(per_thread));
