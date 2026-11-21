@@ -986,39 +986,75 @@ fn write_campaigns(path: &Path, rows: &[CampRow]) {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// One stable counting-sort pass of `v` into `tmp` on the 11 bits of the id hash at `shift`.
+fn radix_pass(v: &[(u64, u32)], tmp: &mut Vec<(u64, u32)>, shift: u32) {
+    let mut cnt = [0u32; 2049];
+    for e in v {
+        cnt[((e.0 >> shift) & 2047) as usize + 1] += 1;
+    }
+    for i in 0..2048 {
+        cnt[i + 1] += cnt[i];
+    }
+    tmp.clear();
+    // SAFETY: the counting pass writes every slot of 0..v.len() exactly once.
+    unsafe { tmp.set_len(v.len()) };
+    for e in v {
+        let d = ((e.0 >> shift) & 2047) as usize;
+        tmp[cnt[d] as usize] = *e;
+        cnt[d] += 1;
+    }
+}
+
 /// Dedup one event-id shard: for every event id keep the copy with the smallest ingest_ts
 /// (equal ones are identical). A kept copy that is invalid drops the event. Returns the
-/// indices of the valid kept copies.
+/// indices of the valid kept copies, ascending.
 #[inline(never)]
-fn pick_kept(all: &mut [Rec]) -> Vec<u32> {
-    // the first id word is shared only by copies of one event, or in a freak collision by a few
-    all.sort_unstable_by_key(|r| r.id[0]);
-    let mut kept: Vec<u32> = Vec::with_capacity(all.len());
+fn pick_kept(all: &[Rec]) -> Vec<u32> {
+    let n = all.len();
+    // Copies of one event share their first id word. Bucket the (word, index) pairs by 22 of its
+    // bits (the low 8 are the shard number): equal words end up in the same small bucket.
+    let mut keys: Vec<(u64, u32)> = all.iter().enumerate().map(|(i, r)| (r.id[0], i as u32)).collect();
+    let mut tmp: Vec<(u64, u32)> = Vec::with_capacity(n);
+    radix_pass(&keys, &mut tmp, 8);
+    radix_pass(&tmp, &mut keys, 19);
+    let bucket = |e: &(u64, u32)| (e.0 >> 8) & 0x3f_ffff;
+    let mut keep = vec![false; n];
     let mut i = 0;
-    while i < all.len() {
+    while i < n {
         let mut j = i + 1;
-        while j < all.len() && all[j].id[0] == all[i].id[0] {
+        while j < n && bucket(&keys[j]) == bucket(&keys[i]) {
             j += 1;
         }
         if j == i + 1 {
-            if all[i].ok {
-                kept.push(i as u32);
-            }
+            keep[keys[i].1 as usize] = all[keys[i].1 as usize].ok;
         } else {
-            for k in i..j {
-                let r = &all[k];
-                if all[i..k].iter().any(|o| o.id == r.id) {
-                    continue;
+            keys[i..j].sort_unstable_by_key(|e| e.0);
+            let mut g = i;
+            while g < j {
+                let mut h = g + 1;
+                while h < j && keys[h].0 == keys[g].0 {
+                    h += 1;
                 }
-                let best = (k..j).filter(|&m| all[m].id == r.id).min_by_key(|&m| all[m].ing).unwrap();
-                if all[best].ok {
-                    kept.push(best as u32);
+                // the first id word is shared only by copies of one event, or in a freak
+                // collision by a few events: resolve by the whole id
+                for k in g..h {
+                    let r = &all[keys[k].1 as usize];
+                    if keys[g..k].iter().any(|o| all[o.1 as usize].id == r.id) {
+                        continue;
+                    }
+                    let best = (k..h)
+                        .map(|m| keys[m].1 as usize)
+                        .filter(|&m| all[m].id == r.id)
+                        .min_by_key(|&m| all[m].ing)
+                        .unwrap();
+                    keep[best] = all[best].ok;
                 }
+                g = h;
             }
         }
         i = j;
     }
-    kept
+    (0..n as u32).filter(|&i| keep[i as usize]).collect()
 }
 
 /// Replace the user id hash of every kept record by its person key and name; returns the
