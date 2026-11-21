@@ -453,16 +453,18 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 
 /// Product id hash -> category code. Open addressing with the 64-bit hash as the whole key:
 /// small enough to stay in cache, and no string compare on a lookup.
-struct ProdTable {
+struct StrTable<V> {
     mask: usize,
     keys: Vec<u64>,
-    cats: Vec<u8>,
+    cats: Vec<V>,
 }
 
-impl ProdTable {
-    fn new(n: usize) -> ProdTable {
+type ProdTable = StrTable<u8>;
+
+impl<V: Copy + Default> StrTable<V> {
+    fn new(n: usize) -> StrTable<V> {
         let cap = (n * 2).next_power_of_two().max(16);
-        ProdTable { mask: cap - 1, keys: vec![0; cap], cats: vec![0; cap] }
+        StrTable { mask: cap - 1, keys: vec![0; cap], cats: vec![V::default(); cap] }
     }
 
     #[inline]
@@ -471,7 +473,7 @@ impl ProdTable {
     }
 
     /// Insert or overwrite (a later row for the same product wins).
-    fn insert(&mut self, id: &[u8], cat: u8) {
+    fn insert(&mut self, id: &[u8], cat: V) {
         let h = Self::key(id);
         let mut i = h as usize & self.mask;
         while self.keys[i] != 0 && self.keys[i] != h {
@@ -482,7 +484,7 @@ impl ProdTable {
     }
 
     #[inline]
-    fn get(&self, id: &[u8]) -> Option<u8> {
+    fn get(&self, id: &[u8]) -> Option<V> {
         let h = Self::key(id);
         let mut i = h as usize & self.mask;
         loop {
@@ -504,7 +506,7 @@ struct Ctx {
     base: i64,
     products: ProdTable,
     unknown: u8,
-    campaigns: HashMap<Bytes, u32>,
+    campaigns: StrTable<u32>,
 }
 
 /// Linked id hash -> (person key, person name). Open addressing over power-of-two arrays so a
@@ -822,7 +824,7 @@ fn parse_clicks(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, flat: &mut Vec<Clic
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let Some(&cid) = ctx.campaigns.get(f[2]) else { return };
+        let Some(cid) = ctx.campaigns.get(f[2]) else { return };
         let Some(ts) = tsp.parse(f[3]) else { return };
         if ts < ctx.ws - WEEK_MS || ts >= ctx.we {
             return;
@@ -913,27 +915,43 @@ fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
 
 fn build_links(files: &[PathBuf]) -> LinkTable {
     let ch = chunks(files, SMALL_CHUNK);
-    let pairs: Vec<Vec<[(u64, Bytes); 2]>> = ch
+    // (hash, packed name) of both ends of every link, per chunk
+    let pairs: Vec<Vec<[(u64, u64); 2]>> = ch
         .par_iter()
         .map(|c| {
             let mut v = Vec::with_capacity(c.len() / 40 + 4);
             for_each_line::<2>(c, |f| {
                 if !f[0].is_empty() && !f[1].is_empty() && f[0] != f[1] {
-                    v.push([(xxh3_64(f[0]), f[0]), (xxh3_64(f[1]), f[1])]);
+                    v.push([(xxh3_64(f[0]), pack(f[0])), (xxh3_64(f[1]), pack(f[1]))]);
                 }
             });
             v
         })
         .collect();
-    let ep: Vec<[(u64, Bytes); 2]> = pairs.concat();
-    std::mem::forget(pairs);
-    let name_of = |slot: u32| ep[slot as usize / 2][slot as usize % 2].1;
+    // global link number of each chunk's first link; endpoint slot = 2 * link + side
+    let mut first: Vec<usize> = Vec::with_capacity(pairs.len());
+    let mut acc = 0;
+    for v in &pairs {
+        first.push(acc);
+        acc += v.len();
+    }
+    let name_of = |slot: u32| {
+        let e = slot as usize / 2;
+        let c = first.partition_point(|&o| o <= e) - 1;
+        pairs[c][e - first[c]][slot as usize % 2].1
+    };
 
     // dense ids: sort the (hash, endpoint) pairs; each distinct hash is one id
-    let mut keys: Vec<(u64, u32)> = ep
+    let mut keys: Vec<(u64, u32)> = pairs
         .par_iter()
         .enumerate()
-        .flat_map_iter(|(i, e)| [(e[0].0, 2 * i as u32), (e[1].0, 2 * i as u32 + 1)])
+        .flat_map_iter(|(c, v)| {
+            let f = first[c];
+            v.iter().enumerate().flat_map(move |(i, e)| {
+                let s = 2 * (f + i) as u32;
+                [(e[0].0, s), (e[1].0, s + 1)]
+            })
+        })
         .collect();
     keys.par_sort_unstable_by_key(|k| k.0);
     let m = keys.len();
@@ -952,7 +970,7 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
     }
     let n = acc as usize;
     let mut hashes: Vec<u64> = vec![0; n];
-    let mut names: Vec<Bytes> = vec![&[]; n];
+    let mut names: Vec<u64> = vec![0; n]; // packed
     let mut end_id: Vec<u32> = vec![0; m];
     {
         let (hp, np, ep_) = (SyncPtr(hashes.as_mut_ptr()), SyncPtr(names.as_mut_ptr()), SyncPtr(end_id.as_mut_ptr()));
@@ -982,7 +1000,7 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
     (0..n).into_par_iter().for_each(|i| {
         let r = &best[root[i] as usize];
         let mut cur = r.load(Relaxed);
-        while cur == u32::MAX || names[i] < names[cur as usize] {
+        while cur == u32::MAX || unpack(names[i]) < unpack(names[cur as usize]) {
             match r.compare_exchange_weak(cur, i as u32, Relaxed, Relaxed) {
                 Ok(_) => break,
                 Err(c) => cur = c,
@@ -1010,7 +1028,7 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
                 match keys_a[j].compare_exchange(0, h, Relaxed, Relaxed) {
                     Ok(_) => {
                         // SAFETY: the slot was claimed by this worker alone.
-                        unsafe { vals.write(j, (xxh3_64(nm), pack(nm))) };
+                        unsafe { vals.write(j, (xxh3_64(unpack(nm)), nm)) };
                         break;
                     }
                     Err(_) => j = (j + 1) & mask,
@@ -1018,7 +1036,7 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
             }
         });
     }
-    std::mem::forget(ep);
+    std::mem::forget(pairs);
     linked
 }
 
@@ -1756,7 +1774,11 @@ fn main() {
     // all times are kept as u32 ms offsets from the click window start
     let base = ws - WEEK_MS;
     assert!(we - base < u32::MAX as i64, "window too long for 32-bit time offsets");
-    let ctx = Ctx { ws, we, base, products, unknown, campaigns };
+    let mut camp_table = StrTable::<u32>::new(campaigns.len());
+    for (k, &v) in &campaigns {
+        camp_table.insert(k, v);
+    }
+    let ctx = Ctx { ws, we, base, products, unknown, campaigns: camp_table };
 
     let linked = build_links(&csv_files(&data.join("links")));
     log(&t, &format!("links: {} linked ids", linked.len()));
