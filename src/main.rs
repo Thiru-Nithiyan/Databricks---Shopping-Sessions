@@ -32,7 +32,11 @@ type Bytes = &'static [u8];
 // ------------------------------------------------------------------ utilities
 
 fn log(t: &Instant, msg: &str) {
-    eprintln!("[{:7.2}s] {}", t.elapsed().as_secs_f64(), msg);
+    let anon = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|st| st.lines().find(|l| l.starts_with("RssAnon")).map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string()))
+        .unwrap_or_default();
+    eprintln!("[{:7.2}s] {} (anon {} MB)", t.elapsed().as_secs_f64(), msg, anon.parse::<u64>().unwrap_or(0) / 1024);
 }
 
 /// Map a file for the life of the process.
@@ -1038,7 +1042,7 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
             }
         });
     }
-    std::mem::forget(keys);
+    drop(keys); // freed memory is reused by the event parse
 
     // connected components, then the byte-wise smallest name of each
     let parent: Vec<AtomicU32> = (0..n as u32).into_par_iter().map(AtomicU32::new).collect();
@@ -1087,7 +1091,7 @@ fn build_links(files: &[PathBuf]) -> LinkTable {
             }
         });
     }
-    std::mem::forget(pairs);
+    drop(pairs);
     linked
 }
 
