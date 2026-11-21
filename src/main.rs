@@ -829,9 +829,8 @@ fn write_campaigns(path: &Path, rows: &[CampRow]) {
 
 // ------------------------------------------------------------------ main
 
-static T_GATHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static T_SORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static T_SCAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
     let t = Instant::now();
@@ -906,17 +905,12 @@ fn main() {
     let deduped: Vec<Vec<Vec<Ev>>> = (0..NSHARD)
         .into_par_iter()
         .map(|s| {
-            let t0 = Instant::now();
             let n: usize = parsed.iter().map(|c| c.shard(s).len()).sum();
             let mut all: Vec<Rec> = Vec::with_capacity(n);
             for c in &parsed {
                 all.extend_from_slice(c.shard(s));
             }
-            let t1 = Instant::now();
             all.sort_unstable_by_key(|r| (r.id, r.ing));
-            let t2 = Instant::now();
-            T_GATHER.fetch_add((t1 - t0).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            T_SORT.fetch_add((t2 - t1).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut cnt = [0u32; NPART];
             let mut prev: Option<[u64; 2]> = None;
             for r in &all {
@@ -946,11 +940,9 @@ fn main() {
                     });
                 }
             }
-            T_SCAT.fetch_add(t2.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             parts
         })
         .collect();
-    eprintln!("gather {} sort {} scatter {} (cpu-ms)", T_GATHER.load(std::sync::atomic::Ordering::Relaxed)/1000, T_SORT.load(std::sync::atomic::Ordering::Relaxed)/1000, T_SCAT.load(std::sync::atomic::Ordering::Relaxed)/1000);
     std::mem::forget(parsed); // freeing thousands of small vectors costs more than it saves
     log(&t, "events deduped");
 

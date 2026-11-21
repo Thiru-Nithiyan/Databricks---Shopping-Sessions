@@ -13,6 +13,7 @@ rayon = "1.10"
 memchr = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hashbrown = "0.15"
+mimalloc = { version = "0.1", default-features = false }
 parquet = { version = "55", default-features = false }
 
 [profile.release]
