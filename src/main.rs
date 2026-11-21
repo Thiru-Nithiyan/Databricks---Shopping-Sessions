@@ -365,10 +365,57 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 
 // ------------------------------------------------------------------ context
 
+/// Product id hash -> category code. Open addressing with the 64-bit hash as the whole key:
+/// small enough to stay in cache, and no string compare on a lookup.
+struct ProdTable {
+    mask: usize,
+    keys: Vec<u64>,
+    cats: Vec<u8>,
+}
+
+impl ProdTable {
+    fn new(n: usize) -> ProdTable {
+        let cap = (n * 2).next_power_of_two().max(16);
+        ProdTable { mask: cap - 1, keys: vec![0; cap], cats: vec![0; cap] }
+    }
+
+    #[inline]
+    fn key(id: &[u8]) -> u64 {
+        xxh3_64(id) | 1 // 0 marks an empty slot
+    }
+
+    /// Insert or overwrite (a later row for the same product wins).
+    fn insert(&mut self, id: &[u8], cat: u8) {
+        let h = Self::key(id);
+        let mut i = h as usize & self.mask;
+        while self.keys[i] != 0 && self.keys[i] != h {
+            i = (i + 1) & self.mask;
+        }
+        self.keys[i] = h;
+        self.cats[i] = cat;
+    }
+
+    #[inline]
+    fn get(&self, id: &[u8]) -> Option<u8> {
+        let h = Self::key(id);
+        let mut i = h as usize & self.mask;
+        loop {
+            let k = self.keys[i];
+            if k == h {
+                return Some(self.cats[i]);
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 struct Ctx {
     ws: i64,
     we: i64,
-    products: HashMap<Bytes, u8>,
+    products: ProdTable,
     unknown: u8,
     campaigns: HashMap<Bytes, u32>,
 }
@@ -611,7 +658,7 @@ fn parse_events(chunk: Bytes, ctx: &Ctx, linked: &LinkTable, sc: &mut Scratch) -
                 name: pack(f[1]),
                 ts: ts.unwrap(),
                 price,
-                cat: *ctx.products.get(f[5]).unwrap_or(&ctx.unknown),
+                cat: ctx.products.get(f[5]).unwrap_or(ctx.unknown),
                 purch: et == 2,
             });
         }
@@ -1375,7 +1422,7 @@ fn main() {
     cat_names.push(b"unknown");
     cat_names.sort_unstable();
     cat_names.dedup();
-    let mut products: HashMap<Bytes, u8> = HashMap::new();
+    let mut products = ProdTable::new(prod_rows.len());
     for r in &prod_rows {
         if let Ok(c) = cat_names.binary_search(&r[1]) {
             products.insert(r[0], c as u8);
