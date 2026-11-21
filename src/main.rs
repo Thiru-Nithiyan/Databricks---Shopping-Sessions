@@ -1061,53 +1061,47 @@ struct GKey {
     chunk: u32,
 }
 
-/// One stable counting-sort pass of `v` into `tmp` on the 11 bits of the first id word at `shift`.
-fn radix_pass(v: &[GKey], tmp: &mut Vec<GKey>, shift: u32) {
-    let mut cnt = [0u32; 2049];
-    for e in v {
-        cnt[((e.id0 >> shift) & 2047) as usize + 1] += 1;
-    }
-    for i in 0..2048 {
-        cnt[i + 1] += cnt[i];
-    }
-    tmp.clear();
-    tmp.reserve(v.len());
-    // SAFETY: capacity is reserved and the counting pass writes every slot of 0..v.len() once.
-    unsafe { tmp.set_len(v.len()) };
-    for e in v {
-        let d = ((e.id0 >> shift) & 2047) as usize;
-        tmp[cnt[d] as usize] = *e;
-        cnt[d] += 1;
-    }
-}
-
 /// Dedup one event-id shard: for every event id the copy with the smallest ingest_ts is kept
-/// (equal ones are identical); every other valid copy is marked dead in its chunk.
+/// (equal ones are identical); every other valid copy is marked dead in its chunk. The table
+/// holds the current winner of each id as (32-bit tag of the first id word, index in `g`), so
+/// a probe rarely touches `g`.
 #[inline(never)]
-fn dedup_shard(g: &mut Vec<GKey>, tmp: &mut Vec<GKey>, chunks: &[EvChunk]) {
-    // Copies of one event share their first id word. Bucket by 22 of its bits (the low 8 are the
-    // shard number): equal words end up in the same small bucket.
-    radix_pass(g, tmp, 8);
-    radix_pass(tmp, g, 19);
-    let bucket = |e: &GKey| (e.id0 >> 8) & 0x3f_ffff;
-    let n = g.len();
-    let mut i = 0;
-    while i < n {
-        let mut j = i + 1;
-        while j < n && bucket(&g[j]) == bucket(&g[i]) {
-            j += 1;
+fn dedup_shard(g: &[GKey], table: &mut Vec<u64>, chunks: &[EvChunk]) {
+    const EMPTY: u64 = u64::MAX;
+    let cap = (g.len() * 2).next_power_of_two().max(1024);
+    let mask = cap - 1;
+    table.clear();
+    table.resize(cap, EMPTY);
+    let kill = |k: &GKey| {
+        if k.rec != u32::MAX {
+            let r = k.rec as usize;
+            chunks[k.chunk as usize].dead[r >> 6].fetch_or(1 << (r & 63), Relaxed);
         }
-        if j > i + 1 {
-            g[i..j].sort_unstable_by_key(|e| (e.id0, e.id1, e.ing));
-            for k in i + 1..j {
-                let (a, b) = (&g[k - 1], &g[k]);
-                if a.id0 == b.id0 && a.id1 == b.id1 && b.rec != u32::MAX {
-                    let r = b.rec as usize;
-                    chunks[b.chunk as usize].dead[r >> 6].fetch_or(1 << (r & 63), Relaxed);
+    };
+    for (i, k) in g.iter().enumerate() {
+        let tag = k.id0 >> 32;
+        let mut j = (k.id0 >> 8) as usize & mask; // the low 8 bits are the shard number
+        loop {
+            let e = table[j];
+            if e == EMPTY {
+                table[j] = tag << 32 | i as u64;
+                break;
+            }
+            if e >> 32 == tag {
+                let w = (e & 0xffff_ffff) as usize;
+                let o = &g[w];
+                if o.id0 == k.id0 && o.id1 == k.id1 {
+                    if k.ing < o.ing {
+                        kill(o);
+                        table[j] = tag << 32 | i as u64;
+                    } else {
+                        kill(k);
+                    }
+                    break;
                 }
             }
+            j = (j + 1) & mask;
         }
-        i = j;
     }
 }
 
@@ -1184,13 +1178,13 @@ fn main() {
 
     // dedup per event-id shard
     (0..NSHARD).into_par_iter().for_each_init(
-        || (Vec::<GKey>::new(), Vec::<GKey>::new()),
-        |(g, tmp), s| {
+        || (Vec::<GKey>::new(), Vec::<u64>::new()),
+        |(g, table), s| {
             g.clear();
             for (ci, c) in parsed.iter().enumerate() {
                 g.extend(c.shard(s).iter().map(|k| GKey { id0: k.id0, ing: k.ing, id1: k.id1, rec: k.rec, chunk: ci as u32 }));
             }
-            dedup_shard(g, tmp, &parsed);
+            dedup_shard(g, table, &parsed);
         },
     );
     log(&t, "events deduped");
